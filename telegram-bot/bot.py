@@ -1,42 +1,41 @@
+import os
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-BOT_TOKEN = "8571822830:AAH0PRPvBEDEzOa3AjZbBFSMGnsM9UDs3uQ"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-TARGET_CHANNEL_ID = -1003595038397 # ID CHANNEL
-
-REQUIRED_TAG = "#pria" "#wanita"
+REQUIRED_TAGS = ["#pria", "#wanita"]
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-
-   
-
     text = msg.text or msg.caption or ""
 
-    # Validasi tag
-    if REQUIRED_TAG not in text:
+    # ubah ke lowercase biar fleksibel
+    text_lower = text.lower()
+
+    # cek tag
+    if not any(tag in text_lower for tag in REQUIRED_TAGS):
         await msg.reply_text(
-            f"❌ ditolak.\nWajib menyertakan tag {REQUIRED_TAG}"
+            "❌ Post ditolak.\n\n"
+            "Wajib menggunakan salah satu tag:\n"
+            "#pria atau #wanita"
         )
         return
 
-    # Kirim ke channel
-    if msg.photo:
-        await context.bot.send_photo(
-            chat_id=TARGET_CHANNEL_ID,
-            photo=msg.photo[-1].file_id,
-            caption=msg.caption
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=TARGET_CHANNEL_ID,
-            text=msg.text
-        )
+    # lolos validasi
+    await msg.reply_text("✅ Post diterima, sedang diproses…")
 
-    await msg.reply_text("✅  berhasil dikirim.")
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.ALL, handle_message))
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.ALL, handle_message))
-app.run_polling()
+    print("Bot running...")
+    app.run_polling()
 
+if __name__ == "__main__":
+    main()
