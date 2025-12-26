@@ -5,7 +5,7 @@ BOT_TOKEN = "8571822830:AAH0PRPvBEDEzOa3AjZbBFSMGnsM9UDs3uQ"
 
 TARGET_CHANNEL_ID = -1003595038397 # ID CHANNEL
 
-REQUIRED_TAG = "#POST"
+REQUIRED_TAG = "#pria" "#wanita"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -17,7 +17,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Validasi tag
     if REQUIRED_TAG not in text:
         await msg.reply_text(
-            f"❌ Post ditolak.\nWajib menyertakan tag {REQUIRED_TAG}"
+            f"❌ ditolak.\nWajib menyertakan tag {REQUIRED_TAG}"
         )
         return
 
@@ -34,8 +34,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=msg.text
         )
 
-    await msg.reply_text("✅ Post berhasil dikirim ke channel.")
+    await msg.reply_text("✅  berhasil dikirim.")
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(MessageHandler(filters.ALL, handle_message))
 app.run_polling()
+
