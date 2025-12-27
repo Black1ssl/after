@@ -6,6 +6,7 @@ from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     MessageHandler,
+    CommandHandler,
     ContextTypes,
     filters,
 )
@@ -177,6 +178,44 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("Ban gagal:", e)
 
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = msg.from_user
+    chat = msg.chat
+
+    # Cek jika di grup
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("Perintah ini hanya untuk grup.")
+        return
+
+    # Cek status admin
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    if member.status not in ("administrator", "creator"):
+        await msg.reply_text("❌ Hanya admin yang bisa menggunakan perintah ini.")
+        return
+
+    # Parse argumen
+    args = context.args
+    if not args:
+        await msg.reply_text("❌ Gunakan: /unban <user_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await msg.reply_text("❌ User ID harus berupa angka.")
+        return
+
+    # Unban user
+    try:
+        await context.bot.unban_chat_member(
+            chat_id=chat.id,
+            user_id=target_user_id
+        )
+        await msg.reply_text(f"✅ User {target_user_id} telah di-unban.")
+    except Exception as e:
+        await msg.reply_text(f"❌ Gagal unban: {str(e)}")
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -197,6 +236,8 @@ def main():
             anti_link
         )
     )
+
+    app.add_handler(CommandHandler("unban", unban_user))
 
     print("Bot running...")
     app.run_polling()
