@@ -13,6 +13,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = 7186582328  # ID pemilik grup
 TAGS = ["#pria", "#wanita"]
 CHANNEL_ID = -1003595038397  # ganti dengan ID channel kamu
 # atau pakai username channel:
@@ -190,8 +191,8 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Cek status admin
     member = await context.bot.get_chat_member(chat.id, user.id)
-    if member.status not in ("administrator", "creator"):
-        await msg.reply_text("❌ Hanya admin yang bisa menggunakan perintah ini.")
+    if user.id != OWNER_ID and member.status not in ("administrator", "creator"):
+        await msg.reply_text("❌ Hanya pemilik grup atau admin yang bisa menggunakan perintah ini.")
         return
 
     # Parse argumen
