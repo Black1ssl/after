@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import time
-from telegram import Update
+from telegram import Update, Message
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -41,8 +41,8 @@ CREATE TABLE IF NOT EXISTS welcomed_users (
 """)
 db.commit()
 
-# 🧠 Fungsi LOG ADMIN (BARU)
-async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Update.message.__class__, gender: str):
+# 🧠 Fungsi LOG ADMIN (diperbaiki tipe)
+async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str):
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
@@ -82,7 +82,7 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Update.me
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if msg.from_user.is_bot:
+    if not msg or msg.from_user is None or msg.from_user.is_bot:
         return
 
     text = (msg.text or msg.caption or "").lower()
@@ -100,23 +100,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = msg.from_user.id
     username = msg.from_user.username
-    cur = db.cursor()
 
-    cur.execute("SELECT gender FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+    # gunakan context manager untuk cursor supaya commit/rollback otomatis
+    with db:
+        cur = db.cursor()
+        cur.execute("SELECT gender FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
 
-    if row and row[0] != gender:
-        await msg.reply_text(
-            f"❌ Post ditolak.\nGender akun kamu sudah tercatat sebagai #{row[0]}."
-        )
-        return
+        if row and row[0] != gender:
+            await msg.reply_text(
+                f"❌ Post ditolak.\nGender akun kamu sudah tercatat sebagai #{row[0]}."
+            )
+            return
 
-    if not row:
-        cur.execute(
-            "INSERT INTO users (user_id, username, gender) VALUES (?,?,?)",
-            (user_id, username, gender)
-        )
-        db.commit()
+        if not row:
+            cur.execute(
+                "INSERT INTO users (user_id, username, gender) VALUES (?,?,?)",
+                (user_id, username, gender)
+            )
+            # commit handled by context manager
 
     caption = msg.text or msg.caption or ""
 
@@ -155,6 +157,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if not msg:
+        return
     chat_id = msg.chat.id
 
     # hapus pesan "user joined"
@@ -163,10 +167,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat_id=chat_id,
             message_id=msg.message_id
         )
-    except:
+    except Exception:
         pass
-
-    cur = db.cursor()
 
     for user in msg.new_chat_members:
         if user.is_bot:
@@ -174,21 +176,21 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         user_id = user.id
 
-        # cek apakah sudah pernah di-welcome
-        cur.execute(
-            "SELECT 1 FROM welcomed_users WHERE user_id=? AND chat_id=?",
-            (user_id, chat_id)
-        )
+        # cek apakah sudah pernah di-welcome (gunakan context manager)
+        with db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT 1 FROM welcomed_users WHERE user_id=? AND chat_id=?",
+                (user_id, chat_id)
+            )
+            if cur.fetchone():
+                continue  # sudah pernah, jangan nyepam
 
-        if cur.fetchone():
-            continue  # sudah pernah, jangan nyepam
-
-        # simpan sebagai sudah di-welcome
-        cur.execute(
-            "INSERT INTO welcomed_users (user_id, chat_id) VALUES (?, ?)",
-            (user_id, chat_id)
-        )
-        db.commit()
+            # simpan sebagai sudah di-welcome
+            cur.execute(
+                "INSERT INTO welcomed_users (user_id, chat_id) VALUES (?, ?)",
+                (user_id, chat_id)
+            )
 
         # kirim welcome
         await context.bot.send_message(
@@ -206,6 +208,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if not msg or msg.from_user is None:
+        return
     user = msg.from_user
     chat = msg.chat
 
@@ -213,15 +217,20 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 🔐 cek status user (admin atau bukan)
-    member = await context.bot.get_chat_member(chat.id, user.id)
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        member = None
 
-    if member.status in ("administrator", "creator"):
+    if member and member.status in ("administrator", "creator"):
         return  # admin kebal
 
     # 🗑️ hapus pesan link
     try:
         await msg.delete()
     except BadRequest:
+        pass
+    except Exception:
         pass
 
     # ⏱️ ban 1 jam
@@ -248,6 +257,8 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if not msg:
+        return
     user = msg.from_user
     chat = msg.chat
 
@@ -257,8 +268,12 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Cek status admin
-    member = await context.bot.get_chat_member(chat.id, user.id)
-    if user.id != OWNER_ID and member.status not in ("administrator", "creator"):
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        member = None
+
+    if user.id != OWNER_ID and (not member or member.status not in ("administrator", "creator")):
         await msg.reply_text("❌ Hanya pemilik grup atau admin yang bisa menggunakan perintah ini.")
         return
 
@@ -287,9 +302,10 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # HANDLER PRIVATE: terima semua jenis pesan (text/photo/video/caption)
     app.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND,
             handle_message
         )
     )
@@ -298,9 +314,10 @@ def main():
         MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member)
     )
 
+    # ANTI-LINK: tangkap url dan text_link (lebih aman daripada hanya "url")
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS & filters.Entity("url"),
+            filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")),
             anti_link
         )
     )
