@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import time
+import logging
 from telegram import Update, Message
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -12,7 +13,15 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN environment variable is not set. Exiting.")
+    raise SystemExit("BOT_TOKEN environment variable is required")
+
 OWNER_ID = 7186582328  # ID pemilik grup
 TAGS = ["#pria", "#wanita"]
 CHANNEL_ID = -1003595038397  # ganti dengan ID channel kamu
@@ -21,6 +30,9 @@ CHANNEL_ID = -1003595038397  # ganti dengan ID channel kamu
 
 # 🔧 Tambahan Konfigurasi (WAJIB)
 LOG_CHANNEL_ID = -1003439614621  # channel log/admin (private)
+
+# base dir untuk gambar default (gunakan path absolut)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # database
 db = sqlite3.connect("users.db", check_same_thread=False)
@@ -41,7 +53,7 @@ CREATE TABLE IF NOT EXISTS welcomed_users (
 """)
 db.commit()
 
-# 🧠 Fungsi LOG ADMIN (diperbaiki tipe)
+# 🧠 Fungsi LOG ADMIN (diperbaiki tipe dan default image path)
 async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str):
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
@@ -71,14 +83,30 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
                 parse_mode=ParseMode.HTML
             )
         else:
-            await context.bot.send_message(
-                chat_id=LOG_CHANNEL_ID,
-                text=log_caption,
-                parse_mode=ParseMode.HTML
+            # coba kirim gambar default berdasarkan gender (path absolut)
+            image_path = os.path.join(
+                BASE_DIR,
+                "pria.png" if gender == "pria" else "wanita.png"
             )
+            try:
+                with open(image_path, "rb") as img:
+                    await context.bot.send_photo(
+                        chat_id=LOG_CHANNEL_ID,
+                        photo=img,
+                        caption=log_caption,
+                        parse_mode=ParseMode.HTML
+                    )
+            except Exception:
+                # fallback ke teks kalau gagal
+                await context.bot.send_message(
+                    chat_id=LOG_CHANNEL_ID,
+                    text=log_caption,
+                    parse_mode=ParseMode.HTML
+                )
     except Exception as e:
         # jangan crash bot kalau log gagal
-        print("Gagal mengirim log:", e)
+        logger.exception("Gagal mengirim log: %s", e)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -139,10 +167,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=caption
             )
         else:
-            await context.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=caption
+            # 📝 TEKS SAJA → KIRIM GAMBAR DEFAULT (path absolut + with open)
+            image_path = os.path.join(
+                BASE_DIR,
+                "pria.png" if gender == "pria" else "wanita.png"
             )
+            try:
+                with open(image_path, "rb") as img:
+                    await context.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=img,
+                        caption=caption
+                    )
+            except FileNotFoundError:
+                # fallback: kirim teks jika gambar default tidak ditemukan
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=caption
+                )
+            except Exception as e:
+                # fallback ke teks dan laporkan error kecil
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=caption
+                )
+                logger.exception("Gagal kirim gambar default: %s", e)
     except Exception as e:
         # jika pengiriman ke publik gagal, beri tahu pengirim
         await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
@@ -154,6 +203,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_to_log_channel(context, msg, gender)
 
     await msg.reply_text("✅ Post berhasil dikirim.")
+
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -206,6 +256,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode=ParseMode.HTML
         )
 
+
 async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.from_user is None:
@@ -253,7 +304,8 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        print("Ban gagal:", e)
+        logger.exception("Ban gagal: %s", e)
+
 
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -299,6 +351,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.reply_text(f"❌ Gagal unban: {str(e)}")
 
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -324,8 +377,9 @@ def main():
 
     app.add_handler(CommandHandler("unban", unban_user))
 
-    print("Bot running...")
+    logger.info("Bot running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
