@@ -8,6 +8,8 @@ import sqlite3
 import tempfile
 import time
 import html
+import sys
+import atexit
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -38,6 +40,32 @@ except Exception:
     openai = None
 
 # ======================
+# SINGLE-INSTANCE LOCK
+# ======================
+LOCK_FILE = "/app/bot.lock"
+
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        print("🧯 Instance lain terdeteksi. Bot dihentikan.")
+        sys.exit(0)
+    try:
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        # pastikan lock dihapus saat bot mati normal
+        atexit.register(release_lock)
+    except Exception:
+        # If we cannot create a lock file, fail fast to avoid multiple instances
+        print("🧯 Gagal membuat lock file. Bot dihentikan.")
+        sys.exit(1)
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+# ======================
 # CONFIG
 # ======================
 logging.basicConfig(level=logging.INFO)
@@ -58,17 +86,16 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003439614621"))
 # ======================
 MAX_DAILY = 2  # max downloads per user per day
 
-# New per-user posting limits (per 24h)
+# per-user posting limits (per 24h)
 MAX_PHOTO_VIDEO_PER_DAY = 10
 MAX_TEXT_PER_DAY = 5
 DAILY_SECONDS = 24 * 60 * 60
 
-# existing
 USER_DAILY_STATS: dict[int, dict] = {}  # user_id -> {"count": int, "first_ts": float} (for downloads)
 USER_ACTIVE_DOWNLOAD: set[int] = set()
 download_lock = asyncio.Semaphore(1)
 
-# New: per-user post stats (photo/video and text) stored in-memory
+# per-user post stats (photo/video and text) stored in-memory
 USER_POST_STATS: Dict[int, Dict[str, int or float]] = {}  # user_id -> {"first_ts": float, "photos_vids": int, "texts": int}
 
 # ======================
@@ -239,12 +266,11 @@ def _reset_post_stats_if_needed(stats: Dict[str, int or float]) -> Dict[str, int
 def is_post_allowed(user_id: int, kind: str) -> Tuple[bool, int]:
     """
     kind: "media" or "text"
-    Returns (allowed, remaining_count)
+    Returns (allowed, remaining_count) — for exceeded returns (False, seconds_until_reset)
     """
     now = time.time()
     stats = USER_POST_STATS.get(user_id)
     if not stats:
-        # allowed full quota
         remaining = MAX_PHOTO_VIDEO_PER_DAY if kind == "media" else MAX_TEXT_PER_DAY
         return True, remaining
     stats = _reset_post_stats_if_needed(stats)
@@ -292,11 +318,9 @@ def decrement_post_count_on_failure(user_id: int, kind: str):
 # ======================
 # Rude/ChatGPT helpers
 # ======================
-# simple in-memory rate limit per-user for rude replies
 LAST_REPLY: dict[int, float] = {}
 CHAT_COOLDOWN = 5  # seconds between replies per user
 
-# blacklist patterns (extend as needed)
 PROTECTED_SLURS = []
 PROTECTED_PATTERNS = [re.compile(r"\b" + re.escape(w) + r"\b", re.IGNORECASE) for w in PROTECTED_SLURS]
 
@@ -351,7 +375,6 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
-    # Escape user-supplied content to avoid HTML injection using stdlib html.escape
     user_text = html.escape((msg.caption or msg.text or ""))
     log_caption = (
         f"👤 <b>Nama:</b> {html.escape(name)}\n"
@@ -391,14 +414,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     username = msg.from_user.username
 
-    # Determine whether this is media (photo/video) or text-only
     is_media = bool(getattr(msg, "photo", None) or getattr(msg, "video", None))
 
-    # Check posting limits per user
     kind = "media" if is_media else "text"
     allowed, rem = is_post_allowed(user_id, kind)
     if not allowed:
-        # rem is remaining seconds until reset
         await msg.reply_text(
             f"😅 Kuota kirim { 'foto/video' if kind=='media' else 'teks' } hari ini sudah habis.\n"
             f"⏳ Reset dalam {human_time(rem)}\n"
@@ -417,11 +437,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("INSERT INTO users (user_id, username, gender) VALUES (?,?,?)", (user_id, username, gender))
 
     caption = msg.text or msg.caption or ""
-    # Attempt to send to public channel, only increment count if success
     try:
         if getattr(msg, "photo", None):
             await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
-            # success -> increment media count
             increment_post_count(user_id, "media")
         elif getattr(msg, "video", None):
             await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
@@ -430,8 +448,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
             increment_post_count(user_id, "text")
     except Exception as e:
-        # Do not count this attempt; if we already incremented (unlikely), decrement
-        # But since increment happens only after success above, no need to decrement here.
         await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
         return
 
@@ -670,7 +686,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             increment_user_count(user_id)
             try:
-                # ensure file descriptor is closed and use with to auto-close file object used by PTB
                 with open(tmpf_name, "rb") as fh:
                     try:
                         await context.bot.send_photo(chat_id=user_id, photo=fh)
@@ -769,7 +784,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             suffix = output_file.suffix.lower()
             try:
-                # Use file-like objects to ensure file descriptors are closed after sending
                 with open(output_file, "rb") as fh:
                     if suffix in (".mp4", ".mkv", ".webm", ".mov"):
                         await context.bot.send_video(chat_id=user_id, video=fh)
@@ -779,7 +793,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_document(chat_id=user_id, document=fh)
             except Exception:
                 try:
-                    # fallback: try sending as document by reopening
                     with open(output_file, "rb") as fh:
                         await context.bot.send_document(chat_id=user_id, document=fh)
                 except Exception as e:
@@ -1046,7 +1059,6 @@ async def handle_rude_confirmation(update: Update, context: ContextTypes.DEFAULT
     if time.time() > pend["expires_at"]:
         PENDING_RUDE_CONFIRMATIONS.pop(chat.id, None)
         return
-    # only initiator can confirm (change if you want admin-anyone)
     if user.id != pend["initiator"]:
         return
     if msg.text.strip().upper() == "I AGREE":
@@ -1070,11 +1082,9 @@ async def mention_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (msg.text or msg.caption or "") or ""
     mentioned = False
 
-    # reply to bot
     if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == bot_user.id:
         mentioned = True
 
-    # check entities
     ents = msg.entities or []
     for ent in ents:
         if ent.type == "text_mention" and getattr(ent, "user", None):
@@ -1122,6 +1132,9 @@ def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is not set.")
         return
+
+    # Acquire single-instance lock to avoid running multiple instances in same host
+    acquire_lock()
 
     # Ensure no webhook conflicts: attempt to delete webhook at startup (with timeout)
     try:
