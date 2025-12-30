@@ -1,29 +1,47 @@
 FROM python:3.11-slim
 
-# Install ffmpeg and required packages
+# ======================
+# SYSTEM DEPENDENCIES
+# ======================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
+# ======================
+# WORKDIR
+# ======================
 WORKDIR /app
 
-# Copy requirements and install
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# ======================
+# INSTALL PYTHON DEPS
+# ======================
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Copy app files
-COPY . /app
+# ======================
+# COPY APP
+# ======================
+COPY . .
 
-# Create non-root user, create data dir and set ownership (so bot can write)
-RUN useradd -m botuser || true \
+# ======================
+# SECURITY: NON-ROOT USER
+# ======================
+RUN useradd -m botuser \
     && mkdir -p /app/data \
     && chown -R botuser:botuser /app
 
-# Switch to non-root user
 USER botuser
 
+# ======================
+# ENV
+# ======================
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# Pastikan menjalankan file yang sesuai (ubah ke signup_bot.py jika itu yang kamu pakai)
+# ======================
+# START BOT
+# ======================
 CMD ["python", "bot.py"]
