@@ -66,6 +66,12 @@ MAX_PHOTO_VIDEO_PER_DAY = 10
 MAX_TEXT_PER_DAY = 5
 DAILY_SECONDS = 24 * 60 * 60
 
+# Track active downloads (per-user set)
+USER_ACTIVE_DOWNLOAD: set = set()
+
+# per-user locks for download to avoid global semaphore bottleneck
+USER_DL_LOCKS = defaultdict(lambda: asyncio.Semaphore(1))
+
 # NOTE: moved important counters to persistent sqlite tables (see below).
 # Keep CHAT_CONTEXT in-memory (ephemeral).
 CHAT_CONTEXT: Dict[int, List[Dict[str, str]]] = {}  # chat_id -> list of messages {"role": "...", "content": "..." }
@@ -79,8 +85,6 @@ SYSTEM_PROMPT = (
 )
 
 # Per-day chat counters (moved to DB)
-# USER_CHAT_COUNTS: Dict[int, int] = {}  # removed in favor of DB
-
 # Phrases to send on daily reset (kata-kata saat reset hari)
 DAILY_RESET_PHRASES = [
     "Mantap! Terus aktif, tapi jangan lupa minum air.",
@@ -490,8 +494,6 @@ async def generate_chatgpt_reply(chat_id: int, user_display: str, user_text: str
 # DOWNLOAD HANDLERS
 # ======================
 
-# Replace global single semaphore with per-user semaphores to avoid global queueing.
-USER_DL_LOCKS = defaultdict(lambda: asyncio.Semaphore(1))
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -1361,10 +1363,41 @@ async def _daily_wrapper_send(app_instance):
 
 
 def seconds_until_next_midnight_local() -> int:
-    t = time.localtime()
-    midnight = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, t.tm_wday, t.tm_yday, t.tm_isdst))
-    next_mid = midnight + DAILY_SECONDS
-    return max(1, int(next_mid - time.time()))
+    """
+    Hitung detik sampai tengah malam lokal berikutnya.
+    Aman terhadap DST dan timezone lokal.
+    """
+    now = time.time()
+    t = time.localtime(now)
+    # gunakan tm_mday + 1 untuk mendapatkan tengah malam hari berikutnya
+    midnight = time.mktime((
+        t.tm_year,
+        t.tm_mon,
+        t.tm_mday + 1,
+        0, 0, 0,
+        0, 0, -1
+    ))
+    wait = int(midnight - now)
+    return max(1, wait)
+
+
+async def daily_reset_job(app_instance):
+    """
+    Background task yang menunggu sampai tengah malam lokal lalu memanggil _daily_wrapper_send.
+    Loop terus menerus sehingga reset harian selalu berjalan.
+    """
+    while True:
+        wait_seconds = seconds_until_next_midnight_local()
+        logger.info("Daily reset job sleeping for %s seconds", wait_seconds)
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            logger.info("Daily reset job cancelled, exiting.")
+            return
+        try:
+            await _daily_wrapper_send(app_instance)
+        except Exception:
+            logger.exception("Unhandled error in daily_reset_job")
 
 
 # ======================
@@ -1416,6 +1449,9 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # register daily reset background task
+    app.create_task(daily_reset_job(app))
+
     # Handlers
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.Entity("url") & ~filters.Entity("text_link") & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
@@ -1445,20 +1481,6 @@ def main():
     app.add_handler(CommandHandler("reset_chat_stats", reset_chat_stats_command))
 
     app.add_handler(CommandHandler("help", help_command))
-
-    # schedule daily reset job using an asyncio background task
-    first = seconds_until_next_midnight_local()
-
-    async def _bg_daily():
-        await asyncio.sleep(first)
-        while True:
-            try:
-                await _daily_wrapper_send(app)
-            except Exception:
-                logger.exception("Error di background daily reset loop")
-            await asyncio.sleep(DAILY_SECONDS)
-
-    app.create_task(_bg_daily())
 
     logger.info("Bot running...")
     app.run_polling(drop_pending_updates=True)
