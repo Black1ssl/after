@@ -1323,7 +1323,7 @@ async def reset_chat_stats_command(update: Update, context: ContextTypes.DEFAULT
 
 
 # ======================
-# DAILY RESET (async background)
+# DAILY RESET (via JobQueue)
 # ======================
 
 
@@ -1381,23 +1381,9 @@ def seconds_until_next_midnight_local() -> int:
     return max(1, wait)
 
 
-async def daily_reset_job(app_instance):
-    """
-    Background task yang menunggu sampai tengah malam lokal lalu memanggil _daily_wrapper_send.
-    Loop terus menerus sehingga reset harian selalu berjalan.
-    """
-    while True:
-        wait_seconds = seconds_until_next_midnight_local()
-        logger.info("Daily reset job sleeping for %s seconds", wait_seconds)
-        try:
-            await asyncio.sleep(wait_seconds)
-        except asyncio.CancelledError:
-            logger.info("Daily reset job cancelled, exiting.")
-            return
-        try:
-            await _daily_wrapper_send(app_instance)
-        except Exception:
-            logger.exception("Unhandled error in daily_reset_job")
+# JobQueue wrapper for daily reset
+async def _job_daily_reset(context: ContextTypes.DEFAULT_TYPE):
+    await _daily_wrapper_send(context.application)
 
 
 # ======================
@@ -1449,8 +1435,10 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # register daily reset background task
-    app.create_task(daily_reset_job(app))
+    # schedule daily reset job using JobQueue (safe; does not require an already-running event loop)
+    first = seconds_until_next_midnight_local()
+    # run_repeating will start when the application starts; uses first=seconds until next midnight
+    app.job_queue.run_repeating(_job_daily_reset, interval=DAILY_SECONDS, first=first)
 
     # Handlers
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.Entity("url") & ~filters.Entity("text_link") & ~filters.COMMAND, handle_message))
