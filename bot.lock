@@ -1,0 +1,55 @@
+import os
+import sys
+import atexit
+
+LOCK_FILE = os.getenv("LOCK_FILE", "/tmp/bot.lock")
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        # signal 0 only checks existence (POSIX). On Windows, raises OSError if not exists.
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    else:
+        return True
+
+def acquire_lock():
+    # jika file sudah ada, cek apakah process di file masih hidup
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as f:
+                content = f.read().strip()
+                if content:
+                    pid = int(content)
+                    if _pid_is_running(pid):
+                        print("🧯 Instance lain terdeteksi (PID {}). Bot dihentikan.".format(pid))
+                        sys.exit(0)
+                    else:
+                        # stale lock -> hapus dan lanjut
+                        os.remove(LOCK_FILE)
+        except Exception:
+            # jika ada masalah membaca -> hapus untuk safety (opsional)
+            try:
+                os.remove(LOCK_FILE)
+            except Exception:
+                pass
+
+    # coba buat file lock secara atomik
+    try:
+        fd = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        atexit.register(release_lock)
+    except FileExistsError:
+        print("🧯 Gagal membuat lock: sudah ada. Bot dihentikan.")
+        sys.exit(0)
+    except Exception as e:
+        print("🧯 Gagal membuat lock file ({}) — hentikan.".format(e))
+        sys.exit(1)
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
