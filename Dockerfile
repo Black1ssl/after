@@ -21,4 +21,5 @@ USER botuser
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "signup_bot.py"]
+# Ganti bot.py jika nama file utama berbeda
+CMD ["python", "bot.py"]
