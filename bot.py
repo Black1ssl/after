@@ -56,10 +56,27 @@ USER_ACTIVE_DOWNLOAD: set[int] = set()
 download_lock = asyncio.Semaphore(1)
 
 # ======================
-# DATABASE
+# DATABASE (safe path + fallback)
 # ======================
-db = sqlite3.connect("users.db", check_same_thread=False)
-db.execute("PRAGMA journal_mode=WAL;")
+DB_PATH = os.getenv("DB_PATH", "/app/data/users.db")
+db_dir = os.path.dirname(DB_PATH)
+try:
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+except Exception as e:
+    logger.exception("Gagal membuat direktori database %s: %s", db_dir, e)
+    DB_PATH = ":memory:"
+    logger.warning("Menggunakan SQLite in-memory fallback (tidak persistent).")
+
+try:
+    db = sqlite3.connect(DB_PATH, check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL;")
+except sqlite3.OperationalError as e:
+    logger.exception("Gagal membuka database %s: %s", DB_PATH, e)
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL;")
+    logger.warning("Fallback ke in-memory SQLite database (data tidak disimpan).")
+
 db.execute(
     """
 CREATE TABLE IF NOT EXISTS users (
@@ -397,7 +414,16 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmpdir = tempfile.mkdtemp(prefix="yt-dl-")
             out_template = str(Path(tmpdir) / "output.%(ext)s")
 
+            # detect ffmpeg availability and adjust options accordingly
+            ffmpeg_available = shutil.which("ffmpeg") is not None
+
             if data == "q_mp3":
+                if not ffmpeg_available:
+                    await query.edit_message_text(
+                        "⚠️ Konversi ke MP3 memerlukan ffmpeg yang tidak tersedia di server.\n"
+                        "Silakan pilih format video (360p/720p) atau jalankan bot di environment dengan ffmpeg (gunakan Docker)."
+                    )
+                    return
                 ydl_opts = {
                     "format": "bestaudio/best",
                     "outtmpl": out_template,
@@ -410,15 +436,26 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
             else:
                 max_h = 360 if data == "q_360" else 720
-                fmt = f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]"
-                ydl_opts = {
-                    "format": fmt,
-                    "outtmpl": out_template,
-                    "merge_output_format": "mp4",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noplaylist": True,
-                }
+                if ffmpeg_available:
+                    fmt = f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]"
+                    ydl_opts = {
+                        "format": fmt,
+                        "outtmpl": out_template,
+                        "merge_output_format": "mp4",
+                        "quiet": True,
+                        "no_warnings": True,
+                        "noplaylist": True,
+                    }
+                else:
+                    # fallback to single-file progressive format if no ffmpeg
+                    fmt = "best"
+                    ydl_opts = {
+                        "format": fmt,
+                        "outtmpl": out_template,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "noplaylist": True,
+                    }
 
             def run_ydl():
                 with YoutubeDL(ydl_opts) as ydl:
