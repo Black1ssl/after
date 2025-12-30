@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import requests
 import shutil
 import sqlite3
 import tempfile
@@ -1010,6 +1011,13 @@ def main():
         logger.error("BOT_TOKEN environment variable is not set.")
         return
 
+    # Ensure no webhook conflicts: attempt to delete webhook at startup
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
+        logger.info("deleteWebhook response: %s", resp.text)
+    except Exception as e:
+        logger.exception("Gagal delete webhook: %s", e)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # PRIVATE menfess handler: exclude messages that contain url/text_link
@@ -1050,7 +1058,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
 
     logger.info("Bot running...")
-    app.run_polling()
+    # Use drop_pending_updates=True to discard old updates and avoid processing backlog
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
