@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 import logging
 import os
@@ -11,6 +12,7 @@ import html
 import random
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
+from collections import defaultdict
 
 from telegram import (
     InlineKeyboardButton,
@@ -64,14 +66,8 @@ MAX_PHOTO_VIDEO_PER_DAY = 10
 MAX_TEXT_PER_DAY = 5
 DAILY_SECONDS = 24 * 60 * 60
 
-USER_DAILY_STATS: dict[int, dict] = {}  # user_id -> {"count": int, "first_ts": float} (for downloads)
-USER_ACTIVE_DOWNLOAD: set[int] = set()
-download_lock = asyncio.Semaphore(1)
-
-# per-user post stats (photo/video and text) stored in-memory
-USER_POST_STATS: Dict[int, Dict[str, int or float]] = {}  # user_id -> {"first_ts": float, "photos_vids": int, "texts": int}
-
-# ChatGPT conversation context per chat (in-memory)
+# NOTE: moved important counters to persistent sqlite tables (see below).
+# Keep CHAT_CONTEXT in-memory (ephemeral).
 CHAT_CONTEXT: Dict[int, List[Dict[str, str]]] = {}  # chat_id -> list of messages {"role": "...", "content": "..." }
 MAX_CONTEXT_MESSAGES = 12  # keep last N messages (system + user/assistant turns)
 SYSTEM_PROMPT = (
@@ -82,8 +78,8 @@ SYSTEM_PROMPT = (
     "dengan nada pedas tapi sopan. Jangan menyebarkan data pribadi atau doxxing."
 )
 
-# Per-day chat counters (used to determine most active user each day)
-USER_CHAT_COUNTS: Dict[int, int] = {}  # user_id -> count
+# Per-day chat counters (moved to DB)
+# USER_CHAT_COUNTS: Dict[int, int] = {}  # removed in favor of DB
 
 # Phrases to send on daily reset (kata-kata saat reset hari)
 DAILY_RESET_PHRASES = [
@@ -143,50 +139,40 @@ CREATE TABLE IF NOT EXISTS group_settings (
 )
 """
 )
+
+# Persistent counters/tables to mitigate data-loss and multi-instance chaos
+db.execute(
+    """
+CREATE TABLE IF NOT EXISTS user_daily_stats (
+    user_id INTEGER PRIMARY KEY,
+    count INTEGER,
+    first_ts REAL
+)
+"""
+)
+db.execute(
+    """
+CREATE TABLE IF NOT EXISTS user_post_stats (
+    user_id INTEGER PRIMARY KEY,
+    first_ts REAL,
+    photos_vids INTEGER DEFAULT 0,
+    texts INTEGER DEFAULT 0
+)
+"""
+)
+db.execute(
+    """
+CREATE TABLE IF NOT EXISTS user_chat_counts (
+    user_id INTEGER PRIMARY KEY,
+    count INTEGER DEFAULT 0
+)
+"""
+)
 db.commit()
 
 # ======================
 # HELPERS
 # ======================
-
-
-def is_user_allowed(user_id: int, max_daily: int = MAX_DAILY) -> Tuple[bool, int]:
-    now = time.time()
-    stats = USER_DAILY_STATS.get(user_id)
-    if not stats:
-        return True, 0
-    first_ts = stats["first_ts"]
-    count = stats["count"]
-    elapsed = now - first_ts
-    if elapsed >= DAILY_SECONDS:
-        return True, 0
-    if count < max_daily:
-        return True, 0
-    remaining = int(DAILY_SECONDS - elapsed)
-    return False, remaining
-
-
-def increment_user_count(user_id: int):
-    now = time.time()
-    stats = USER_DAILY_STATS.get(user_id)
-    if not stats:
-        USER_DAILY_STATS[user_id] = {"count": 1, "first_ts": now}
-    else:
-        first_ts = stats["first_ts"]
-        if now - first_ts >= DAILY_SECONDS:
-            USER_DAILY_STATS[user_id] = {"count": 1, "first_ts": now}
-        else:
-            stats["count"] += 1
-
-
-def decrement_user_count_on_failure(user_id: int):
-    stats = USER_DAILY_STATS.get(user_id)
-    if not stats:
-        return
-    if stats["count"] <= 1:
-        USER_DAILY_STATS.pop(user_id, None)
-    else:
-        stats["count"] -= 1
 
 
 def human_time(seconds: int) -> str:
@@ -247,87 +233,161 @@ def set_rude_mode(chat_id: int, enabled: bool):
 
 
 # ======================
-# Post-limits helpers (photo/video & text)
+# Persistent counters helpers (DB-backed)
 # ======================
 
 
-def _reset_post_stats_if_needed(stats: Dict[str, int or float]) -> Dict[str, int or float]:
+def _get_daily_row(user_id: int) -> Optional[Tuple[int, float]]:
+    cur = db.cursor()
+    cur.execute("SELECT count, first_ts FROM user_daily_stats WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def is_user_allowed(user_id: int, max_daily: int = MAX_DAILY) -> Tuple[bool, int]:
     now = time.time()
-    first_ts = stats.get("first_ts", 0)
-    if now - first_ts >= DAILY_SECONDS:
-        return {"first_ts": now, "photos_vids": 0, "texts": 0}
-    return stats
+    row = _get_daily_row(user_id)
+    if not row:
+        return True, 0
+    count, first_ts = row
+    elapsed = now - first_ts
+    if elapsed >= DAILY_SECONDS:
+        return True, 0
+    if count < max_daily:
+        return True, 0
+    remaining = int(DAILY_SECONDS - elapsed)
+    return False, remaining
+
+
+def increment_user_count(user_id: int):
+    now = time.time()
+    row = _get_daily_row(user_id)
+    with db:
+        cur = db.cursor()
+        if not row:
+            cur.execute("INSERT INTO user_daily_stats (user_id, count, first_ts) VALUES (?, ?, ?)", (user_id, 1, now))
+        else:
+            count, first_ts = row
+            if now - first_ts >= DAILY_SECONDS:
+                cur.execute("UPDATE user_daily_stats SET count=?, first_ts=? WHERE user_id=?", (1, now, user_id))
+            else:
+                cur.execute("UPDATE user_daily_stats SET count=? WHERE user_id=?", (count + 1, user_id))
+
+
+def decrement_user_count_on_failure(user_id: int):
+    row = _get_daily_row(user_id)
+    if not row:
+        return
+    count, first_ts = row
+    with db:
+        cur = db.cursor()
+        if count <= 1:
+            cur.execute("DELETE FROM user_daily_stats WHERE user_id=?", (user_id,))
+        else:
+            cur.execute("UPDATE user_daily_stats SET count=? WHERE user_id=?", (count - 1, user_id))
+
+
+# ======================
+# Post-limits helpers (photo/video & text) - DB-backed
+# ======================
+
+
+def _get_post_row(user_id: int) -> Optional[Tuple[float, int, int]]:
+    cur = db.cursor()
+    cur.execute("SELECT first_ts, photos_vids, texts FROM user_post_stats WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    return (row[0], row[1], row[2]) if row else None
 
 
 def is_post_allowed(user_id: int, kind: str) -> Tuple[bool, int]:
     now = time.time()
-    stats = USER_POST_STATS.get(user_id)
-    if not stats:
+    row = _get_post_row(user_id)
+    if not row:
         remaining = MAX_PHOTO_VIDEO_PER_DAY if kind == "media" else MAX_TEXT_PER_DAY
         return True, remaining
-    stats = _reset_post_stats_if_needed(stats)
-    USER_POST_STATS[user_id] = stats
+    first_ts, photos_vids, texts = row
+    if now - first_ts >= DAILY_SECONDS:
+        remaining = MAX_PHOTO_VIDEO_PER_DAY if kind == "media" else MAX_TEXT_PER_DAY
+        return True, remaining
     if kind == "media":
-        used = stats.get("photos_vids", 0)
-        if used >= MAX_PHOTO_VIDEO_PER_DAY:
-            remaining_seconds = int(DAILY_SECONDS - (now - stats["first_ts"]))
+        if photos_vids >= MAX_PHOTO_VIDEO_PER_DAY:
+            remaining_seconds = int(DAILY_SECONDS - (now - first_ts))
             return False, remaining_seconds
-        return True, MAX_PHOTO_VIDEO_PER_DAY - used
+        return True, MAX_PHOTO_VIDEO_PER_DAY - photos_vids
     else:
-        used = stats.get("texts", 0)
-        if used >= MAX_TEXT_PER_DAY:
-            remaining_seconds = int(DAILY_SECONDS - (now - stats["first_ts"]))
+        if texts >= MAX_TEXT_PER_DAY:
+            remaining_seconds = int(DAILY_SECONDS - (now - first_ts))
             return False, remaining_seconds
-        return True, MAX_TEXT_PER_DAY - used
+        return True, MAX_TEXT_PER_DAY - texts
 
 
 def increment_post_count(user_id: int, kind: str):
     now = time.time()
-    stats = USER_POST_STATS.get(user_id)
-    if not stats:
-        stats = {"first_ts": now, "photos_vids": 0, "texts": 0}
-        USER_POST_STATS[user_id] = stats
-    else:
-        stats = _reset_post_stats_if_needed(stats)
-        USER_POST_STATS[user_id] = stats
-    if kind == "media":
-        stats["photos_vids"] = stats.get("photos_vids", 0) + 1
-    else:
-        stats["texts"] = stats.get("texts", 0) + 1
+    row = _get_post_row(user_id)
+    with db:
+        cur = db.cursor()
+        if not row or (now - row[0] >= DAILY_SECONDS):
+            photos = 1 if kind == "media" else 0
+            texts = 1 if kind != "media" else 0
+            cur.execute(
+                "INSERT INTO user_post_stats (user_id, first_ts, photos_vids, texts) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET first_ts=excluded.first_ts, photos_vids=excluded.photos_vids, texts=excluded.texts",
+                (user_id, now, photos, texts),
+            )
+        else:
+            first_ts, photos_vids, texts = row
+            if kind == "media":
+                cur.execute("UPDATE user_post_stats SET photos_vids=? WHERE user_id=?", (photos_vids + 1, user_id))
+            else:
+                cur.execute("UPDATE user_post_stats SET texts=? WHERE user_id=?", (texts + 1, user_id))
 
 
 def decrement_post_count_on_failure(user_id: int, kind: str):
-    stats = USER_POST_STATS.get(user_id)
-    if not stats:
+    row = _get_post_row(user_id)
+    if not row:
         return
-    key = "photos_vids" if kind == "media" else "texts"
-    if stats.get(key, 0) <= 1:
-        stats[key] = 0
-    else:
-        stats[key] -= 1
+    first_ts, photos_vids, texts = row
+    with db:
+        cur = db.cursor()
+        if kind == "media":
+            if photos_vids <= 1:
+                cur.execute("UPDATE user_post_stats SET photos_vids=0 WHERE user_id=?", (user_id,))
+            else:
+                cur.execute("UPDATE user_post_stats SET photos_vids=? WHERE user_id=?", (photos_vids - 1, user_id))
+        else:
+            if texts <= 1:
+                cur.execute("UPDATE user_post_stats SET texts=0 WHERE user_id=?", (user_id,))
+            else:
+                cur.execute("UPDATE user_post_stats SET texts=? WHERE user_id=?", (texts - 1, user_id))
 
 
 # ======================
-# Chat count helpers (new feature)
+# Chat count helpers (DB-backed)
 # ======================
 
 
 def increment_chat_count(user_id: int):
-    USER_CHAT_COUNTS[user_id] = USER_CHAT_COUNTS.get(user_id, 0) + 1
+    cur = db.cursor()
+    cur.execute("SELECT count FROM user_chat_counts WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    with db:
+        if not row:
+            cur.execute("INSERT INTO user_chat_counts (user_id, count) VALUES (?, ?)", (user_id, 1))
+        else:
+            cur.execute("UPDATE user_chat_counts SET count=? WHERE user_id=?", (row[0] + 1, user_id))
 
 
 def reset_chat_counts():
-    USER_CHAT_COUNTS.clear()
+    with db:
+        cur = db.cursor()
+        cur.execute("DELETE FROM user_chat_counts")
 
 
 def get_top_chat_user() -> Optional[Tuple[int, int]]:
-    """
-    Returns (user_id, count) of top chat user, or None if no data.
-    """
-    if not USER_CHAT_COUNTS:
-        return None
-    top = max(USER_CHAT_COUNTS.items(), key=lambda kv: kv[1])
-    return top  # (user_id, count)
+    cur = db.cursor()
+    cur.execute("SELECT user_id, count FROM user_chat_counts ORDER BY count DESC LIMIT 1")
+    row = cur.fetchone()
+    return (row[0], row[1]) if row else None
 
 
 # ======================
@@ -357,6 +417,8 @@ async def generate_rude_reply(prompt: str) -> str:
         ]
         return canned[int(time.time()) % len(canned)]
 
+    # Use a more future-proof model name
+    model_name = "gpt-4o-mini"
     system_prompt = (
         "Kamu asisten berbahasa Indonesia dengan nada sarkastik/kasar ringan. Balas singkat (maks 2 kalimat). "
         "JANGAN mengandung ancaman, ujaran kebencian, slurs terhadap protected groups, konten seksual eksplisit, atau ajakan kekerasan. "
@@ -366,7 +428,7 @@ async def generate_rude_reply(prompt: str) -> str:
     try:
         resp = await asyncio.to_thread(
             lambda: openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+                model=model_name,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 max_tokens=120,
                 temperature=0.8,
@@ -392,6 +454,7 @@ async def generate_chatgpt_reply(chat_id: int, user_display: str, user_text: str
         ]
         return canned[int(time.time()) % len(canned)]
 
+    model_name = "gpt-4o-mini"
     ctx = CHAT_CONTEXT.get(chat_id, [])
     if not ctx or ctx[0].get("role") != "system":
         ctx = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -403,7 +466,7 @@ async def generate_chatgpt_reply(chat_id: int, user_display: str, user_text: str
     try:
         resp = await asyncio.to_thread(
             lambda: openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+                model=model_name,
                 messages=ctx,
                 max_tokens=300,
                 temperature=0.8,
@@ -427,6 +490,8 @@ async def generate_chatgpt_reply(chat_id: int, user_display: str, user_text: str
 # DOWNLOAD HANDLERS
 # ======================
 
+# Replace global single semaphore with per-user semaphores to avoid global queueing.
+USER_DL_LOCKS = defaultdict(lambda: asyncio.Semaphore(1))
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -535,7 +600,8 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("⏳ Mengunduh, mohon tunggu...")
     tmpdir = None
     try:
-        async with download_lock:
+        # Use per-user semaphore to avoid global blocking.
+        async with USER_DL_LOCKS[user_id]:
             USER_ACTIVE_DOWNLOAD.add(user_id)
             increment_user_count(user_id)
             tmpdir = tempfile.mkdtemp(prefix="yt-dl-")
@@ -568,7 +634,14 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
-            await asyncio.to_thread(run_ydl)
+            # add a hard timeout so that blocked yt-dlp/ffmpeg won't hang forever
+            try:
+                await asyncio.wait_for(asyncio.to_thread(run_ydl), timeout=300)
+            except asyncio.TimeoutError:
+                decrement_user_count_on_failure(user_id)
+                logger.exception("yt-dlp timeout for user %s, url: %s", user_id, url)
+                await query.edit_message_text("❌ Proses download melebihi batas waktu (timeout). Coba lagi nanti.")
+                return
 
             files = list(Path(tmpdir).iterdir())
             if not files:
@@ -905,6 +978,8 @@ async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ======================
 # Rude mode & mention handler
 # ======================
+
+
 PENDING_RUDE_CONFIRMATIONS: Dict[int, Dict[str, float]] = {}
 RUD_MODE_CONFIRM_TIMEOUT = 30  # seconds for confirmation
 
@@ -1058,6 +1133,114 @@ async def mention_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
+# TAG COMMANDS
+# ======================
+
+
+async def tag_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /tag : Admin reply ke pesan user lalu bot akan mention user itu di chat.
+    Usage: reply ke pesan user + /tag
+    """
+    msg = update.message
+    if not msg:
+        return
+    chat = msg.chat
+    user = msg.from_user
+
+    # hanya di group/supergroup
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("Perintah /tag hanya untuk grup.")
+        return
+
+    # cek permission admin (atau owner)
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        member = None
+    if user.id != OWNER_ID and (not member or member.status not in ("administrator", "creator")):
+        await msg.reply_text("❌ Hanya admin atau owner yang dapat menggunakan /tag.")
+        return
+
+    # harus reply ke pesan target
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        await msg.reply_text("Gunakan: reply ke pesan user + /tag")
+        return
+
+    target = msg.reply_to_message.from_user
+    try:
+        mention = f'<a href="tg://user?id={target.id}">{html.escape(target.first_name or "User")}</a>'
+        body = " ".join(context.args) if context.args else "(ditandai oleh admin)"
+        await context.bot.send_message(chat_id=chat.id, text=f"🔔 {mention}\n\n{html.escape(body)}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Gagal menandai member: %s", e)
+        await msg.reply_text(f"❌ Gagal menandai member: {e}")
+
+
+async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /tagall [pesan] : menandai semua user yang tersimpan di welcomed_users untuk chat ini.
+    Hanya admin/owner. Mengirim dalam batch untuk menghindari flood.
+    """
+    msg = update.message
+    if not msg:
+        return
+    chat = msg.chat
+    user = msg.from_user
+
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("Perintah /tagall hanya untuk grup.")
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        member = None
+    if user.id != OWNER_ID and (not member or member.status not in ("administrator", "creator")):
+        await msg.reply_text("❌ Hanya admin atau owner yang dapat menggunakan /tagall.")
+        return
+
+    custom_text = " ".join(context.args) if context.args else None
+    if not custom_text and msg.reply_to_message and msg.reply_to_message.text:
+        custom_text = msg.reply_to_message.text
+
+    with db:
+        cur = db.cursor()
+        cur.execute("SELECT user_id FROM welcomed_users WHERE chat_id=?", (chat.id,))
+        rows = cur.fetchall()
+    user_ids = [r[0] for r in rows if r and isinstance(r[0], int)]
+    if not user_ids:
+        await msg.reply_text("Tidak ada user yang tersimpan untuk ditandai.")
+        return
+
+    # dedup + safety cap
+    seen = set()
+    user_ids = [uid for uid in user_ids if not (uid in seen or seen.add(uid))]
+    MAX_TOTAL = 1000
+    if len(user_ids) > MAX_TOTAL:
+        await msg.reply_text(f"⚠️ Terdapat {len(user_ids)} user, terlalu banyak untuk ditag sekaligus.")
+        return
+
+    batch_size = 20
+    sent_batches = 0
+    body = custom_text or "Perhatian dari admin."
+    try:
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i : i + batch_size]
+            mentions = " ".join(f'<a href="tg://user?id={uid}">.</a>' for uid in batch)
+            text = f"🔔 Panggilan untuk semua:\n{mentions}\n\n{html.escape(body)}"
+            await context.bot.send_message(chat_id=chat.id, text=text, parse_mode=ParseMode.HTML)
+            sent_batches += 1
+            await asyncio.sleep(1)  # jeda kecil antar-batch
+    except Exception as e:
+        logger.exception("Error saat mengirim tagall: %s", e)
+        await msg.reply_text(f"❌ Gagal mengirim tagall: {e}")
+        return
+
+    await msg.reply_text(f"✅ Selesai mengirim tag kepada {len(user_ids)} user dalam {sent_batches} batch.")
+
+
+# ======================
 # GPT CONTEXT & LEADERBOARD COMMANDS
 # ======================
 
@@ -1185,6 +1368,31 @@ def seconds_until_next_midnight_local() -> int:
 
 
 # ======================
+# HELP
+# ======================
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    chat = msg.chat
+    user = msg.from_user
+
+    all_features = (
+        "📚 Fitur Bot (ringkasan):\n\n"
+        "- Menfess via private: kirim teks/foto/video dengan tag #pria atau #wanita\n"
+        "- Download video/audio dari link (360p/720p/MP3)\n"
+        "- Auto-welcome member baru\n"
+        "- Anti-link di grup (hapus + ban sementara)\n"
+        "- Moderation: /ban /kick /unban\n"
+        "- Mode 'rude' (ChatGPT/canned) saat bot ditag (/rude_on /rude_off)\n"
+        "- /gpt_clear, /gpt_status, /topchat, /reset_chat_stats\n"
+    )
+    await msg.reply_text(all_features)
+
+
+# ======================
 # MAIN
 # ======================
 
@@ -1194,7 +1402,7 @@ def main():
         logger.error("BOT_TOKEN environment variable is not set.")
         return
 
-    # Ensure no webhook conflicts: attempt to delete webhook at startup (with timeout)
+    # attempt to delete webhook at startup (avoid webhook/polling conflict)
     try:
         resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=5)
         logger.info("deleteWebhook response: %s", resp.text)
