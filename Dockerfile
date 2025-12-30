@@ -12,6 +12,9 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Verify requests is installed (fail early if not)
+RUN pip show requests || (echo "ERROR: requests not installed" && exit 1)
+
 # Copy app files
 COPY . /app
 
@@ -21,5 +24,5 @@ USER botuser
 
 ENV PYTHONUNBUFFERED=1
 
-# Ganti bot.py jika nama file utama berbeda
+# Pastikan nama file yang dijalankan sesuai (bot.py / signup_bot.py)
 CMD ["python", "bot.py"]
