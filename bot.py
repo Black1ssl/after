@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import html
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -26,7 +27,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.helpers import escape_html
 
 # yt_dlp Python API
 from yt_dlp import YoutubeDL
@@ -351,13 +351,13 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
-    # Escape user-supplied content to avoid HTML injection
-    user_text = escape_html((msg.caption or msg.text or ""))
+    # Escape user-supplied content to avoid HTML injection using stdlib html.escape
+    user_text = html.escape((msg.caption or msg.text or ""))
     log_caption = (
-        f"👤 <b>Nama:</b> {escape_html(name)}\n"
-        f"🔗 <b>Username:</b> {escape_html(username)}\n"
+        f"👤 <b>Nama:</b> {html.escape(name)}\n"
+        f"🔗 <b>Username:</b> {html.escape(username)}\n"
         f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
-        f"⚧ <b>Gender:</b> #{escape_html(gender)}\n\n"
+        f"⚧ <b>Gender:</b> #{html.escape(gender)}\n\n"
         f"{user_text}"
     )
     try:
@@ -463,7 +463,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"👋 Selamat datang <b>{escape_html(user.first_name or '')}</b>!\n\n"
+                f"👋 Selamat datang <b>{html.escape(user.first_name or '')}</b>!\n\n"
                 "📌 <b>Peraturan Grup:</b>\n"
                 "• No rasis 🚫\n"
                 "• Jangan spam 🚫\n"
@@ -500,7 +500,7 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     until_date = int(time.time()) + 3600
     try:
         await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, until_date=until_date)
-        await context.bot.send_message(chat_id=chat.id, text=(f"🚫 <b>{escape_html(user.first_name or '')}</b> diblokir 1 jam\nAlasan: Mengirim link"), parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat.id, text=(f"🚫 <b>{html.escape(user.first_name or '')}</b> diblokir 1 jam\nAlasan: Mengirim link"), parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Ban gagal")
 
