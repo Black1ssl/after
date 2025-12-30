@@ -12,17 +12,18 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Verify requests is installed (fail early if not)
-RUN pip show requests || (echo "ERROR: requests not installed" && exit 1)
-
 # Copy app files
 COPY . /app
 
-# Optional: non-root user
-RUN useradd -m botuser || true
+# Create non-root user, create data dir and set ownership (so bot can write)
+RUN useradd -m botuser || true \
+    && mkdir -p /app/data \
+    && chown -R botuser:botuser /app
+
+# Switch to non-root user
 USER botuser
 
 ENV PYTHONUNBUFFERED=1
 
-# Pastikan nama file yang dijalankan sesuai (bot.py / signup_bot.py)
+# Pastikan menjalankan file yang sesuai (ubah ke signup_bot.py jika itu yang kamu pakai)
 CMD ["python", "bot.py"]
