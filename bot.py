@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
+import aiohttp
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -43,7 +44,7 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003439614621"))
 # ======================
 # LIMITS / QUEUE / STATE
 # ======================
-MAX_DAILY = 1  # max downloads per user per day
+MAX_DAILY = 2  # max downloads per user per day (requested 2x/day)
 DAILY_SECONDS = 24 * 60 * 60
 
 # user -> {"count": int, "first_ts": float}
@@ -169,6 +170,11 @@ def extract_first_url(msg: Message) -> Optional[str]:
     return None
 
 
+def is_image_url(url: str) -> bool:
+    url = url.lower().split("?")[0]
+    return any(url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
+
+
 async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str):
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
@@ -272,6 +278,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if cur.fetchone():
                 continue
             cur.execute("INSERT INTO welcomed_users (user_id, chat_id) VALUES (?, ?)", (user_id, chat_id))
+
+        # Welcome message includes links to the bot and the channel as requested
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -280,6 +288,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "• No rasis 🚫\n"
                 "• Jangan spam 🚫\n"
                 "• Post menfess via bot\n\n"
+                "🔗 Bot menfess: @sixafter_bot\n"
+                "🔗 Channel menfess: https://t.me/sixafter0\n\n"
                 "Semoga betah ya 😊"
             ),
             parse_mode=ParseMode.HTML,
@@ -352,7 +362,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# DOWNLOAD FLOW (yt_dlp)
+# DOWNLOAD FLOW (yt_dlp + image support)
 # ======================
 
 
@@ -366,8 +376,60 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ Tidak menemukan URL di pesan.")
         return
 
-    context.user_data["download_url"] = url
+    # If it's an image URL, download immediately (no quality selection)
+    if is_image_url(url):
+        user_id = msg.from_user.id
+        allowed, remaining = is_user_allowed(user_id)
+        if not allowed:
+            await msg.reply_text(
+                "😅 Kuota download hari ini sudah habis\n\n"
+                f"⏳ Reset dalam {human_time(remaining)}\n"
+                f"📅 Limit: {MAX_DAILY} download / hari"
+            )
+            return
 
+        await msg.reply_text("⏳ Mengunduh foto...")
+        tmpf = None
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, timeout=30) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    content_length = resp.headers.get("Content-Length")
+                    if content_length and int(content_length) > 50 * 1024 * 1024:
+                        await msg.reply_text("❌ Foto lebih besar dari 50MB, tidak dapat dikirim.")
+                        return
+                    data = await resp.read()
+                    if len(data) > 50 * 1024 * 1024:
+                        await msg.reply_text("❌ Foto lebih besar dari 50MB, tidak dapat dikirim.")
+                        return
+                    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(url).suffix or ".jpg")
+                    tmpf.write(data)
+                    tmpf.flush()
+                    tmpf.close()
+
+            # mark usage and send
+            increment_user_count(user_id)
+            try:
+                await context.bot.send_photo(chat_id=user_id, photo=open(tmpf.name, "rb"))
+            except Exception:
+                await context.bot.send_document(chat_id=user_id, document=open(tmpf.name, "rb"))
+            await msg.reply_text("✅ Foto berhasil dikirim.")
+        except Exception as e:
+            decrement_user_count_on_failure(user_id)
+            logger.exception("Gagal mengunduh foto: %s", e)
+            await msg.reply_text(f"❌ Gagal mengunduh foto: {e}")
+        finally:
+            try:
+                if tmpf:
+                    os.unlink(tmpf.name)
+            except Exception:
+                pass
+
+        return
+
+    # otherwise proceed to quality selection flow (for video/audio)
+    context.user_data["download_url"] = url
     keyboard = [
         [InlineKeyboardButton("360p", callback_data="q_360"), InlineKeyboardButton("720p", callback_data="q_720")],
         [InlineKeyboardButton("🎵 MP3", callback_data="q_mp3")],
@@ -423,6 +485,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "⚠️ Konversi ke MP3 memerlukan ffmpeg yang tidak tersedia di server.\n"
                         "Silakan pilih format video (360p/720p) atau jalankan bot di environment dengan ffmpeg (gunakan Docker)."
                     )
+                    decrement_user_count_on_failure(user_id)
                     return
                 ydl_opts = {
                     "format": "bestaudio/best",
@@ -478,6 +541,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "❌ File lebih besar dari 50MB sehingga tidak dapat dikirim melalui Bot Telegram.\n"
                     "Silakan unduh langsung dari sumber (link) atau gunakan metode lain."
                 )
+                decrement_user_count_on_failure(user_id)
                 return
 
             suffix = output_file.suffix.lower()
@@ -512,6 +576,117 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
+# ADMIN TAG COMMAND (only admin and owner)
+# ======================
+
+
+async def tag_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /tag <user_id> <message> OR reply to a user with /tag <message>
+    Only admins/owner can use this in groups.
+    """
+    msg = update.message
+    if not msg:
+        return
+    chat = msg.chat
+    user = msg.from_user
+
+    # This command intended for group contexts
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("Perintah /tag hanya untuk grup.")
+        return
+
+    # check admin
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        member = None
+
+    if user.id != OWNER_ID and (not member or member.status not in ("administrator", "creator")):
+        await msg.reply_text("❌ Hanya admin atau pemilik grup yang dapat menandai member.")
+        return
+
+    # determine target
+    parts = context.args or []
+    text_to_send = ""
+    target_id = None
+    if msg.reply_to_message:
+        target = msg.reply_to_message.from_user
+        target_id = target.id
+        text_to_send = " ".join(parts) if parts else "(ditandai oleh admin)"
+    else:
+        if not parts:
+            await msg.reply_text("Gunakan: /tag <user_id|@username> <pesan>  atau reply ke pesan user dengan /tag <pesan>")
+            return
+        # first arg could be @username or id
+        first = parts[0]
+        rest = parts[1:]
+        text_to_send = " ".join(rest) if rest else "(ditandai oleh admin)"
+        if first.startswith("@"):
+            # try resolve username via get_chat_member? we can try get_chat_member with username not supported; try search via chat
+            # fallback: instruct to reply or use numeric id
+            await msg.reply_text("Gunakan reply atau user_id. Mention by @username tidak didukung, gunakan reply atau user id.")
+            return
+        else:
+            try:
+                target_id = int(first)
+            except ValueError:
+                await msg.reply_text("User ID tidak valid.")
+                return
+
+    try:
+        mention = f'<a href="tg://user?id={target_id}">disini</a>'
+        await context.bot.send_message(chat_id=chat.id, text=f"🔔 {mention}\n\n{text_to_send}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Gagal menandai member: %s", e)
+        await msg.reply_text(f"❌ Gagal menandai member: {e}")
+
+
+# ======================
+# HELP COMMAND (show features & rights)
+# ======================
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    chat = msg.chat
+    user = msg.from_user
+
+    # default member help (private or group)
+    member_help = (
+        "📚 Fitur untuk Member:\n"
+        "- Mengirim menfess via private ke bot: sertakan tag #pria atau #wanita\n"
+        "- Download video/audio dari link (YouTube/TikTok/IG) hingga 50MB\n"
+        "- Download foto dari direct image URL (<=50MB)\n"
+        "- Limit download: 2x per hari\n"
+        "- Gunakan perintah /help untuk melihat bantuan ini\n"
+    )
+
+    admin_help = (
+        "🔑 Tambahan hak untuk Admin:\n"
+        "- Bisa menggunakan /unban <user_id>\n"
+        "- Bisa menandai member dengan /tag (reply ke pesan user atau /tag <user_id> <pesan>)\n"
+        "- Admin kebal dari anti-link\n"
+    )
+
+    if chat.type in ("group", "supergroup"):
+        # check admin status
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+        except Exception:
+            member = None
+        if member and member.status in ("administrator", "creator") or user.id == OWNER_ID:
+            await msg.reply_text("Halo Admin!\n\n" + member_help + "\n" + admin_help)
+        else:
+            await msg.reply_text("Halo Member!\n\n" + member_help)
+    else:
+        # private chat -> show both (member view) and note about admin features
+        await msg.reply_text("Halo!\n\n" + member_help + "\n" + "Catatan: Fitur admin hanya untuk admin di grup.\n" + admin_help)
+
+
+# ======================
 # MAIN SETUP
 # ======================
 
@@ -538,16 +713,27 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
     # Anti-link in groups: catch url and text_link
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")), anti_link))
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")),
+            anti_link,
+        )
+    )
 
     # Unban command
     app.add_handler(CommandHandler("unban", unban_user))
 
-    # Download handlers: URL in private triggers quality keyboard
+    # Download handlers: URL in private triggers quality keyboard or direct image download
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.Entity("url") | filters.Entity("text_link")), download_video))
 
     # CallbackQuery handler for quality selection
     app.add_handler(CallbackQueryHandler(quality_callback, pattern="^q_"))
+
+    # Tag command (admin only in group)
+    app.add_handler(CommandHandler("tag", tag_member))
+
+    # Help command
+    app.add_handler(CommandHandler("help", help_command))
 
     logger.info("Bot running...")
     app.run_polling()
