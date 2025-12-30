@@ -1,10 +1,8 @@
-# https://github.com/github-copilot/pro/signup (local edit)
 import asyncio
 import logging
 import os
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -27,6 +25,9 @@ from telegram.ext import (
     filters,
 )
 
+# yt_dlp Python API
+from yt_dlp import YoutubeDL
+
 # ======================
 # CONFIG
 # ======================
@@ -34,10 +35,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = 7186582328  # ID pemilik grup
+OWNER_ID = int(os.getenv("OWNER_ID", "7186582328"))
 TAGS = ["#pria", "#wanita"]
-CHANNEL_ID = -1003595038397  # ganti dengan ID channel kamu
-LOG_CHANNEL_ID = -1003439614621  # channel log/admin (private)
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003595038397"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003439614621"))
 
 # ======================
 # LIMITS / QUEUE / STATE
@@ -85,10 +86,6 @@ db.commit()
 
 
 def is_user_allowed(user_id: int, max_daily: int = MAX_DAILY) -> Tuple[bool, int]:
-    """
-    Return (allowed, remaining_seconds).
-    If allowed True -> remaining 0.
-    """
     now = time.time()
     stats = USER_DAILY_STATS.get(user_id)
     if not stats:
@@ -97,7 +94,6 @@ def is_user_allowed(user_id: int, max_daily: int = MAX_DAILY) -> Tuple[bool, int
     count = stats["count"]
     elapsed = now - first_ts
     if elapsed >= DAILY_SECONDS:
-        # reset window
         return True, 0
     if count < max_daily:
         return True, 0
@@ -139,7 +135,6 @@ def human_time(seconds: int) -> str:
 
 
 def extract_first_url(msg: Message) -> Optional[str]:
-    """Extract URL from message entities (url or text_link)."""
     if not msg:
         return None
     entities = msg.entities or []
@@ -158,7 +153,6 @@ def extract_first_url(msg: Message) -> Optional[str]:
 
 
 async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str):
-    """Send log (text/photo/video) to LOG_CHANNEL_ID. Non-fatal on failure."""
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
@@ -196,14 +190,12 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Private menfess handler: accepts photo/video/text with #pria/#wanita."""
     msg = update.message
     if not msg or not msg.from_user or msg.from_user.is_bot:
         return
 
     text = (msg.text or msg.caption or "").lower()
 
-    # deteksi gender
     gender = None
     for tag in TAGS:
         if tag in text:
@@ -217,22 +209,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     username = msg.from_user.username
 
-    # gunakan context manager untuk cursor supaya commit/rollback otomatis
     with db:
         cur = db.cursor()
         cur.execute("SELECT gender FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
-
         if row and row[0] != gender:
             await msg.reply_text(f"❌ Post ditolak.\nGender akun kamu sudah tercatat sebagai #{row[0]}.")
             return
-
         if not row:
             cur.execute("INSERT INTO users (user_id, username, gender) VALUES (?,?,?)", (user_id, username, gender))
 
     caption = msg.text or msg.caption or ""
-
-    # kirim ke channel publik
     try:
         if getattr(msg, "photo", None):
             await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
@@ -244,9 +231,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
         return
 
-    # log admin
     await send_to_log_channel(context, msg, gender)
-
     await msg.reply_text("✅ Post berhasil dikirim.")
 
 
@@ -292,15 +277,12 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = msg.chat
     if user.is_bot:
         return
-
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
     except Exception:
         member = None
-
     if member and member.status in ("administrator", "creator"):
         return
-
     try:
         await msg.delete()
     except BadRequest:
@@ -329,27 +311,22 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in ("group", "supergroup"):
         await msg.reply_text("Perintah ini hanya untuk grup.")
         return
-
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
     except Exception:
         member = None
-
     if user.id != OWNER_ID and (not member or member.status not in ("administrator", "creator")):
         await msg.reply_text("❌ Hanya pemilik grup atau admin yang bisa menggunakan perintah ini.")
         return
-
     args = context.args
     if not args:
         await msg.reply_text("❌ Gunakan: /unban <user_id>")
         return
-
     try:
         target_user_id = int(args[0])
     except ValueError:
         await msg.reply_text("❌ User ID harus berupa angka.")
         return
-
     try:
         await context.bot.unban_chat_member(chat_id=chat.id, user_id=target_user_id)
         await msg.reply_text(f"✅ User {target_user_id} telah di-unban.")
@@ -358,14 +335,11 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# DOWNLOAD FLOW
+# DOWNLOAD FLOW (yt_dlp)
 # ======================
 
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Initial handler when user sends a URL in private chat.
-    Shows quality keyboard and saves url to context.user_data.
-    """
     msg = update.message
     if not msg or not msg.from_user:
         return
@@ -386,26 +360,23 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """CallbackQuery handler: user picked quality, perform download with queue + limit."""
     query = update.callback_query
     if not query:
         return
-    await query.answer()  # acknowledge callback
+    await query.answer()
 
     user = query.from_user
     user_id = user.id
-    data = query.data  # q_360, q_720, q_mp3
+    data = query.data
     url = context.user_data.get("download_url")
     if not url:
         await query.edit_message_text("❌ URL tidak ditemukan. Kirim ulang link.")
         return
 
-    # guard against multiple active downloads for same user
     if user_id in USER_ACTIVE_DOWNLOAD:
         await query.answer("⏳ Download kamu masih berjalan", show_alert=True)
         return
 
-    # Check user daily limit
     allowed, remaining = is_user_allowed(user_id)
     if not allowed:
         await query.edit_message_text(
@@ -415,13 +386,11 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # proceed to download: set busy indicator
     await query.edit_message_text("⏳ Mengunduh, mohon tunggu...")
 
     tmpdir = None
     try:
         async with download_lock:
-            # mark active + increment usage (prevent spam clicks)
             USER_ACTIVE_DOWNLOAD.add(user_id)
             increment_user_count(user_id)
 
@@ -429,41 +398,51 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             out_template = str(Path(tmpdir) / "output.%(ext)s")
 
             if data == "q_mp3":
-                cmd = ["yt-dlp", "-x", "--audio-format", "mp3", "-o", out_template, url]
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": out_template,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "postprocessors": [
+                        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+                    ],
+                }
             else:
                 max_h = 360 if data == "q_360" else 720
                 fmt = f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]"
-                cmd = ["yt-dlp", "-f", fmt, "-o", out_template, url]
+                ydl_opts = {
+                    "format": fmt,
+                    "outtmpl": out_template,
+                    "merge_output_format": "mp4",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                }
 
-            logger.info("Running yt-dlp: %s", " ".join(cmd))
-            # Correct subprocess.run invocation inside thread
-            proc = await asyncio.to_thread(subprocess.run, cmd, check=False, capture_output=True, text=True)
+            def run_ydl():
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-            if proc.returncode != 0:
-                stderr = proc.stderr or proc.stdout or f"yt-dlp exited with code {proc.returncode}"
-                raise RuntimeError(stderr.strip())
+            # run blocking yt_dlp in thread
+            await asyncio.to_thread(run_ydl)
 
             files = list(Path(tmpdir).iterdir())
             if not files:
                 raise RuntimeError("Download gagal — tidak ada file output dari yt-dlp.")
-
             files_sorted = sorted(files, key=lambda p: p.stat().st_size, reverse=True)
             output_file = files_sorted[0]
             size_bytes = output_file.stat().st_size
             logger.info("Downloaded file: %s (%d bytes)", output_file, size_bytes)
 
-            # If file too big to send via Telegram Bot API (>50MB), inform user and provide fallback
             TELEGRAM_MAX_BYTES = 50 * 1024 * 1024
             if size_bytes > TELEGRAM_MAX_BYTES:
-                # cleanup to save space and inform user
                 await query.edit_message_text(
                     "❌ File lebih besar dari 50MB sehingga tidak dapat dikirim melalui Bot Telegram.\n"
                     "Silakan unduh langsung dari sumber (link) atau gunakan metode lain."
                 )
-                logger.warning("File too large to send via bot: %s", output_file)
                 return
 
-            # send file to user
             suffix = output_file.suffix.lower()
             try:
                 if suffix in (".mp4", ".mkv", ".webm", ".mov"):
@@ -473,7 +452,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.send_document(chat_id=user_id, document=str(output_file))
             except Exception:
-                # fallback: send as document
                 try:
                     await context.bot.send_document(chat_id=user_id, document=str(output_file))
                 except Exception as e:
@@ -481,7 +459,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text("✅ Download selesai. File telah dikirim ke chat pribadi.")
     except Exception as exc:
-        # rollback count on failure so the user doesn't lose quota
         decrement_user_count_on_failure(user_id)
         logger.exception("Error during download: %s", exc)
         try:
@@ -490,7 +467,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     finally:
         USER_ACTIVE_DOWNLOAD.discard(user_id)
-        # cleanup tmpdir if exists
         try:
             if tmpdir and Path(tmpdir).exists():
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -499,7 +475,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# APP SETUP
+# MAIN SETUP
 # ======================
 
 
@@ -510,7 +486,7 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # PRIVATE menfess handler: exclude messages that contain url/text_link (so they go to download handler)
+    # PRIVATE menfess handler: exclude messages that contain url/text_link
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
