@@ -26,6 +26,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_html
 
 # yt_dlp Python API
 from yt_dlp import YoutubeDL
@@ -56,11 +57,19 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003439614621"))
 # LIMITS / QUEUE / STATE
 # ======================
 MAX_DAILY = 2  # max downloads per user per day
+
+# New per-user posting limits (per 24h)
+MAX_PHOTO_VIDEO_PER_DAY = 10
+MAX_TEXT_PER_DAY = 5
 DAILY_SECONDS = 24 * 60 * 60
 
-USER_DAILY_STATS: dict[int, dict] = {}  # user_id -> {"count": int, "first_ts": float}
+# existing
+USER_DAILY_STATS: dict[int, dict] = {}  # user_id -> {"count": int, "first_ts": float} (for downloads)
 USER_ACTIVE_DOWNLOAD: set[int] = set()
 download_lock = asyncio.Semaphore(1)
+
+# New: per-user post stats (photo/video and text) stored in-memory
+USER_POST_STATS: Dict[int, Dict[str, int or float]] = {}  # user_id -> {"first_ts": float, "photos_vids": int, "texts": int}
 
 # ======================
 # DATABASE (safe path + fallback)
@@ -215,6 +224,72 @@ def set_rude_mode(chat_id: int, enabled: bool):
 
 
 # ======================
+# Post-limits helpers (photo/video & text)
+# ======================
+
+
+def _reset_post_stats_if_needed(stats: Dict[str, int or float]) -> Dict[str, int or float]:
+    now = time.time()
+    first_ts = stats.get("first_ts", 0)
+    if now - first_ts >= DAILY_SECONDS:
+        return {"first_ts": now, "photos_vids": 0, "texts": 0}
+    return stats
+
+
+def is_post_allowed(user_id: int, kind: str) -> Tuple[bool, int]:
+    """
+    kind: "media" or "text"
+    Returns (allowed, remaining_count)
+    """
+    now = time.time()
+    stats = USER_POST_STATS.get(user_id)
+    if not stats:
+        # allowed full quota
+        remaining = MAX_PHOTO_VIDEO_PER_DAY if kind == "media" else MAX_TEXT_PER_DAY
+        return True, remaining
+    stats = _reset_post_stats_if_needed(stats)
+    USER_POST_STATS[user_id] = stats
+    if kind == "media":
+        used = stats.get("photos_vids", 0)
+        if used >= MAX_PHOTO_VIDEO_PER_DAY:
+            remaining_seconds = int(DAILY_SECONDS - (now - stats["first_ts"]))
+            return False, remaining_seconds
+        return True, MAX_PHOTO_VIDEO_PER_DAY - used
+    else:
+        used = stats.get("texts", 0)
+        if used >= MAX_TEXT_PER_DAY:
+            remaining_seconds = int(DAILY_SECONDS - (now - stats["first_ts"]))
+            return False, remaining_seconds
+        return True, MAX_TEXT_PER_DAY - used
+
+
+def increment_post_count(user_id: int, kind: str):
+    now = time.time()
+    stats = USER_POST_STATS.get(user_id)
+    if not stats:
+        stats = {"first_ts": now, "photos_vids": 0, "texts": 0}
+        USER_POST_STATS[user_id] = stats
+    else:
+        stats = _reset_post_stats_if_needed(stats)
+        USER_POST_STATS[user_id] = stats
+    if kind == "media":
+        stats["photos_vids"] = stats.get("photos_vids", 0) + 1
+    else:
+        stats["texts"] = stats.get("texts", 0) + 1
+
+
+def decrement_post_count_on_failure(user_id: int, kind: str):
+    stats = USER_POST_STATS.get(user_id)
+    if not stats:
+        return
+    key = "photos_vids" if kind == "media" else "texts"
+    if stats.get(key, 0) <= 1:
+        stats[key] = 0
+    else:
+        stats[key] -= 1
+
+
+# ======================
 # Rude/ChatGPT helpers
 # ======================
 # simple in-memory rate limit per-user for rude replies
@@ -276,12 +351,14 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
+    # Escape user-supplied content to avoid HTML injection
+    user_text = escape_html((msg.caption or msg.text or ""))
     log_caption = (
-        f"👤 <b>Nama:</b> {name}\n"
-        f"🔗 <b>Username:</b> {username}\n"
+        f"👤 <b>Nama:</b> {escape_html(name)}\n"
+        f"🔗 <b>Username:</b> {escape_html(username)}\n"
         f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
-        f"⚧ <b>Gender:</b> #{gender}\n\n"
-        f"{msg.caption or msg.text or ''}"
+        f"⚧ <b>Gender:</b> #{escape_html(gender)}\n\n"
+        f"{user_text}"
     )
     try:
         if getattr(msg, "photo", None):
@@ -299,11 +376,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.from_user or msg.from_user.is_bot:
         return
 
-    text = (msg.text or msg.caption or "").lower()
+    text_lower = (msg.text or msg.caption or "").lower()
 
     gender = None
     for tag in TAGS:
-        if tag in text:
+        if tag in text_lower:
             gender = tag.replace("#", "")
             break
 
@@ -313,6 +390,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = msg.from_user.id
     username = msg.from_user.username
+
+    # Determine whether this is media (photo/video) or text-only
+    is_media = bool(getattr(msg, "photo", None) or getattr(msg, "video", None))
+
+    # Check posting limits per user
+    kind = "media" if is_media else "text"
+    allowed, rem = is_post_allowed(user_id, kind)
+    if not allowed:
+        # rem is remaining seconds until reset
+        await msg.reply_text(
+            f"😅 Kuota kirim { 'foto/video' if kind=='media' else 'teks' } hari ini sudah habis.\n"
+            f"⏳ Reset dalam {human_time(rem)}\n"
+            f"📅 Batas: {MAX_PHOTO_VIDEO_PER_DAY if kind=='media' else MAX_TEXT_PER_DAY} per hari"
+        )
+        return
 
     with db:
         cur = db.cursor()
@@ -325,14 +417,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("INSERT INTO users (user_id, username, gender) VALUES (?,?,?)", (user_id, username, gender))
 
     caption = msg.text or msg.caption or ""
+    # Attempt to send to public channel, only increment count if success
     try:
         if getattr(msg, "photo", None):
             await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
+            # success -> increment media count
+            increment_post_count(user_id, "media")
         elif getattr(msg, "video", None):
             await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
+            increment_post_count(user_id, "media")
         else:
             await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            increment_post_count(user_id, "text")
     except Exception as e:
+        # Do not count this attempt; if we already incremented (unlikely), decrement
+        # But since increment happens only after success above, no need to decrement here.
         await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
         return
 
@@ -364,7 +463,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"👋 Selamat datang <b>{user.first_name}</b>!\n\n"
+                f"👋 Selamat datang <b>{escape_html(user.first_name or '')}</b>!\n\n"
                 "📌 <b>Peraturan Grup:</b>\n"
                 "• No rasis 🚫\n"
                 "• Jangan spam 🚫\n"
@@ -401,7 +500,7 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     until_date = int(time.time()) + 3600
     try:
         await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, until_date=until_date)
-        await context.bot.send_message(chat_id=chat.id, text=(f"🚫 <b>{user.first_name}</b> diblokir 1 jam\nAlasan: Mengirim link"), parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat.id, text=(f"🚫 <b>{escape_html(user.first_name or '')}</b> diblokir 1 jam\nAlasan: Mengirim link"), parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Ban gagal")
 
@@ -547,7 +646,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await msg.reply_text("⏳ Mengunduh foto...")
-        tmpf = None
+        tmpf_name = None
         try:
             import aiohttp
 
@@ -567,21 +666,29 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tmpf.write(data)
                     tmpf.flush()
                     tmpf.close()
+                    tmpf_name = tmpf.name
 
             increment_user_count(user_id)
             try:
-                await context.bot.send_photo(chat_id=user_id, photo=open(tmpf.name, "rb"))
+                # ensure file descriptor is closed and use with to auto-close file object used by PTB
+                with open(tmpf_name, "rb") as fh:
+                    try:
+                        await context.bot.send_photo(chat_id=user_id, photo=fh)
+                    except Exception:
+                        fh.seek(0)
+                        await context.bot.send_document(chat_id=user_id, document=fh)
+                await msg.reply_text("✅ Foto berhasil dikirim.")
             except Exception:
-                await context.bot.send_document(chat_id=user_id, document=open(tmpf.name, "rb"))
-            await msg.reply_text("✅ Foto berhasil dikirim.")
+                decrement_user_count_on_failure(user_id)
+                raise
         except Exception as e:
             decrement_user_count_on_failure(user_id)
             logger.exception("Gagal mengunduh foto: %s", e)
             await msg.reply_text(f"❌ Gagal mengunduh foto: {e}")
         finally:
             try:
-                if tmpf:
-                    os.unlink(tmpf.name)
+                if tmpf_name and os.path.exists(tmpf_name):
+                    os.unlink(tmpf_name)
             except Exception:
                 pass
         return
@@ -662,15 +769,19 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             suffix = output_file.suffix.lower()
             try:
-                if suffix in (".mp4", ".mkv", ".webm", ".mov"):
-                    await context.bot.send_video(chat_id=user_id, video=str(output_file))
-                elif suffix in (".mp3", ".m4a", ".aac", ".opus"):
-                    await context.bot.send_audio(chat_id=user_id, audio=str(output_file))
-                else:
-                    await context.bot.send_document(chat_id=user_id, document=str(output_file))
+                # Use file-like objects to ensure file descriptors are closed after sending
+                with open(output_file, "rb") as fh:
+                    if suffix in (".mp4", ".mkv", ".webm", ".mov"):
+                        await context.bot.send_video(chat_id=user_id, video=fh)
+                    elif suffix in (".mp3", ".m4a", ".aac", ".opus"):
+                        await context.bot.send_audio(chat_id=user_id, audio=fh)
+                    else:
+                        await context.bot.send_document(chat_id=user_id, document=fh)
             except Exception:
                 try:
-                    await context.bot.send_document(chat_id=user_id, document=str(output_file))
+                    # fallback: try sending as document by reopening
+                    with open(output_file, "rb") as fh:
+                        await context.bot.send_document(chat_id=user_id, document=fh)
                 except Exception as e:
                     raise RuntimeError(f"Gagal mengirim file ke pengguna: {e}")
 
@@ -822,7 +933,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Download video/audio dari hampir semua link (YouTube/TikTok/IG/...) pilih 360p/720p/MP3\n"
         "- Download foto dari direct image URL\n"
         "- Batas file dikirim oleh bot: 50 MB\n"
-        f"- Limit download: {MAX_DAILY}x per hari per user\n\n"
+        f"- Limit download: {MAX_DAILY}x per hari per user\n"
+        f"- Limit menfess per hari: foto/video {MAX_PHOTO_VIDEO_PER_DAY}x, teks {MAX_TEXT_PER_DAY}x\n\n"
         "Admin (harus admin/owner di grup):\n"
         "- /tag <user_id> <pesan> atau reply + /tag : menandai 1 member\n"
         "- /tagall [pesan] : menandai semua member yang tersimpan (batched)\n"
@@ -1011,9 +1123,9 @@ def main():
         logger.error("BOT_TOKEN environment variable is not set.")
         return
 
-    # Ensure no webhook conflicts: attempt to delete webhook at startup
+    # Ensure no webhook conflicts: attempt to delete webhook at startup (with timeout)
     try:
-        resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
+        resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=5)
         logger.info("deleteWebhook response: %s", resp.text)
     except Exception as e:
         logger.exception("Gagal delete webhook: %s", e)
