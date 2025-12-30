@@ -1,4 +1,4 @@
 python-telegram-bot==20.6
-yt-dlp
-aiohttp
+yt-dlp>=2024.01.01
+aiohttp>=3.9.0
 requests>=2.31.0
