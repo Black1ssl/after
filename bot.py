@@ -364,12 +364,12 @@ async def ensure_user_gender(user_id: int, username: Optional[str], gender: str)
 # ---------------------------
 # If env vars empty, look for files in DATA_DIR.
 if not DEFAULT_MALE_IMAGE:
-    candidate = os.path.join(DATA_DIR, "default_male.jpg")
+    candidate = os.path.join(DATA_DIR, "default_male.png")
     if os.path.exists(candidate):
         DEFAULT_MALE_IMAGE = candidate
 
 if not DEFAULT_FEMALE_IMAGE:
-    candidate = os.path.join(DATA_DIR, "default_female.jpg")
+    candidate = os.path.join(DATA_DIR, "default_female.png")
     if os.path.exists(candidate):
         DEFAULT_FEMALE_IMAGE = candidate
 
@@ -1065,3 +1065,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
