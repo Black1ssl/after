@@ -1,14 +1,18 @@
+const express = require("express");
 const { Telegraf } = require("telegraf");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const app = express();
 
 const TARGET = process.env.TARGET_CHANNEL_ID;
 const LOG = process.env.LOG_CHANNEL_ID;
 const OWNER = Number(process.env.OWNER_ID);
-const PORT = process.env.PORT || 3000;
 const DOMAIN = process.env.WEBHOOK_DOMAIN;
+const PORT = process.env.PORT || 3000;
 
-// ================= DATA MEMORY =================
+app.use(express.json());
+
+// ====== DATA ======
 let dailyPost = {};
 let dailyDownload = {};
 let welcomed = new Set();
@@ -19,7 +23,7 @@ setInterval(() => {
   dailyDownload = {};
 }, 24 * 60 * 60 * 1000);
 
-// ================= UTIL =================
+// ====== UTIL ======
 const isBanned = (id) => banned[id] && banned[id] > Date.now();
 
 const log = (ctx, gender, content) => {
@@ -51,11 +55,9 @@ bot.on(["text", "photo", "video"], async (ctx) => {
       return ctx.reply("❌ Batas teks harian tercapai");
 
     dailyPost[ctx.from.id].text++;
-
     await ctx.telegram.sendMessage(TARGET, ctx.message.text, {
       disable_notification: true
     });
-
     log(ctx, gender, ctx.message.text);
   }
 
@@ -64,87 +66,24 @@ bot.on(["text", "photo", "video"], async (ctx) => {
       return ctx.reply("❌ Batas media harian tercapai");
 
     dailyPost[ctx.from.id].media++;
-
     await ctx.telegram.copyMessage(
       TARGET,
       ctx.chat.id,
       ctx.message.message_id,
       { disable_notification: true }
     );
-
     log(ctx, gender, "MEDIA");
   }
 });
 
-// ================= DOWNLOAD LIMIT =================
-bot.hears(/https?:\/\//, (ctx) => {
-  if (ctx.chat.type !== "private") return;
-
-  dailyDownload[ctx.from.id] ??= 0;
-  if (dailyDownload[ctx.from.id] >= 2)
-    return ctx.reply("❌ Limit download harian tercapai");
-
-  dailyDownload[ctx.from.id]++;
-  ctx.reply("🔽 Link diterima.");
+// ====== WEBHOOK ENDPOINT ======
+app.post("/", (req, res) => {
+  bot.handleUpdate(req.body);
+  res.sendStatus(200);
 });
 
-// ================= ANTI LINK GROUP =================
-bot.on("message", async (ctx, next) => {
-  if (ctx.chat.type === "private") return next();
-
-  if (ctx.message?.text?.includes("http")) {
-    const member = await ctx.getChatMember(ctx.from.id);
-    if (member.status !== "administrator") {
-      await ctx.deleteMessage();
-      banned[ctx.from.id] = Date.now() + 60 * 60 * 1000;
-    }
-  }
-  next();
-});
-
-// ================= WELCOME =================
-bot.on("new_chat_members", (ctx) => {
-  ctx.message.new_chat_members.forEach((u) => {
-    if (!welcomed.has(u.id)) {
-      welcomed.add(u.id);
-      ctx.reply(`👋 Selamat datang ${u.first_name}`);
-    }
-  });
-});
-
-// ================= ADMIN =================
-bot.command("ban", (ctx) => {
-  if (ctx.from.id !== OWNER) return;
-  const [_, id, jam] = ctx.message.text.split(" ");
-  banned[id] = Date.now() + (jam || 1) * 60 * 60 * 1000;
-  ctx.reply(`User ${id} diban`);
-});
-
-bot.command("unban", (ctx) => {
-  if (ctx.from.id !== OWNER) return;
-  const id = ctx.message.text.split(" ")[1];
-  delete banned[id];
-  ctx.reply("Unban berhasil");
-});
-
-bot.command("kick", async (ctx) => {
-  if (ctx.from.id !== OWNER) return;
-  const id = ctx.message.text.split(" ")[1];
-  await ctx.kickChatMember(ctx.chat.id, id);
-  ctx.reply("User dikick");
-});
-
-// ================= ERROR HANDLER =================
-process.on("unhandledRejection", console.error);
-process.on("uncaughtException", console.error);
-
-// ================= WEBHOOK LAUNCH =================
-bot.launch({
-  webhook: {
-    domain: DOMAIN,
-    port: PORT
-  },
-  dropPendingUpdates: true
-}).then(() => {
-  console.log("Bot hidup (WEBHOOK MODE).");
+// ====== START SERVER ======
+app.listen(PORT, async () => {
+  await bot.telegram.setWebhook(DOMAIN);
+  console.log("Bot hidup (WEBHOOK EXPRESS MODE)");
 });
