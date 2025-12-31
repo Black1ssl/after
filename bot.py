@@ -66,7 +66,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.helpers import escape_html
+from telegram.helpers import escape_markdown
+from html import escape as escape_html
+
 
 from yt_dlp import YoutubeDL
 
@@ -968,5 +970,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
