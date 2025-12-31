@@ -44,29 +44,37 @@ bot.on(["text", "photo", "video"], async (ctx) => {
 
   dailyPost[ctx.from.id] ??= { text: 0, media: 0 };
 
+  // === TEXT ===
   if (ctx.message.text) {
     if (dailyPost[ctx.from.id].text >= 5)
       return ctx.reply("❌ Batas teks harian tercapai");
+
     dailyPost[ctx.from.id].text++;
-    await ctx.telegram.sendMessage(TARGET, ctx.message.text);
+
+    await ctx.telegram.sendMessage(TARGET, ctx.message.text, {
+      disable_notification: true
+    });
+
     log(ctx, gender, ctx.message.text);
   }
 
+  // === MEDIA ===
   if (ctx.message.photo || ctx.message.video) {
     if (dailyPost[ctx.from.id].media >= 10)
       return ctx.reply("❌ Batas media harian tercapai");
+
     dailyPost[ctx.from.id].media++;
-    await ctx.telegram.copyMessage(TARGET, ctx.chat.id, ctx.message.message_id);
+
+    await ctx.telegram.copyMessage(
+      TARGET,
+      ctx.chat.id,
+      ctx.message.message_id,
+      { disable_notification: true }
+    );
+
     log(ctx, gender, "MEDIA");
   }
 });
-
-bot.on("channel_post", async (ctx) => {
-  try {
-    await ctx.telegram.unpinChatMessage(ctx.chat.id);
-  } catch (e) {}
-});
-
 
 // ===== DOWNLOAD LIMIT =====
 bot.hears(/https?:\/\//, (ctx) => {
@@ -80,6 +88,7 @@ bot.hears(/https?:\/\//, (ctx) => {
 
 // ===== ANTI LINK GROUP =====
 bot.on("message", async (ctx, next) => {
+  if (ctx.chat.type === "private") return next();
   if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
     if (ctx.message.text?.includes("http")) {
       const member = await ctx.getChatMember(ctx.from.id);
@@ -125,5 +134,6 @@ bot.command("kick", async (ctx) => {
 });
 
 bot.launch();
-console.log("Bot hidup. Sayangnya.");
+console.log("Bot hidup.");
+
 
