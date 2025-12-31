@@ -1,35 +1,54 @@
 #!/usr/bin/env python3
 """
-Telegram menfess / downloader bot (merged + fixed)
+Telegram menfess / downloader bot (cleaned: removed 'rude mode').
 
-Features:
-- Single-instance lockfile
-- SQLite persistence (tables: users, welcomed_users, usage_log, last_actions)
-- Daily usage limits (download, menfess_text, menfess_media) stored in usage_log (per date)
-- Persisted cooldowns stored in last_actions (survive restart)
-- Admins (ADMIN_IDS) bypass limits and cooldowns; admin actions do NOT increment usage
-- Menfess flow: requires #pria or #wanita in message (text or media). Forwards to CHANNEL_ID and logs to LOG_CHANNEL_ID
-  - For text-only menfess, the bot will attach a default photo based on gender (male/female) when configured.
-- Download flow: supports direct image URL download and yt-dlp for video/audio (choice via inline keyboard)
-- Safe DB access via asyncio.Lock
-- Uses python-telegram-bot v20+ async API
+File utama: bot.py
 """
+
+# ======================
+# SINGLE INSTANCE LOCK
+# ======================
+import os
+import sys
 import atexit
+
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
+
+if os.path.exists(LOCK_FILE):
+    print("❌ Bot already running (lock file detected). Exiting.")
+    sys.exit(0)
+
+with open(LOCK_FILE, "w") as f:
+    f.write(str(os.getpid()))
+
+print("✅ Lock acquired, bot starting...")
+
+def cleanup_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            print("🧹 Lock file removed, bot stopped cleanly.")
+    except Exception:
+        pass
+
+atexit.register(cleanup_lock)
+
+# ======================
+# IMPORTS (NORMAL FLOW)
+# ======================
 import asyncio
 import logging
-import os
 import re
+import requests
 import shutil
 import sqlite3
 import tempfile
 import time
-from datetime import date
 from pathlib import Path
-from typing import Optional, Tuple
-
-import aiohttp
-from html import escape as escape_html
-from yt_dlp import YoutubeDL
+from typing import Dict, Optional, Tuple
 
 from telegram import (
     InlineKeyboardButton,
@@ -48,157 +67,149 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
+from html import escape as escape_html
 
-# ---------------------------
-# SINGLE INSTANCE LOCK
-# ---------------------------
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
 
-if os.path.exists(LOCK_FILE):
-    print("❌ Bot already running (lock file detected). Exiting.")
-    raise SystemExit(0)
+from yt_dlp import YoutubeDL
 
-with open(LOCK_FILE, "w") as f:
-    f.write(str(os.getpid()))
+def download_video(url):
+    ydl_opts = {
+        "outtmpl": "downloads/%(title)s.%(ext)s"
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-print("✅ Lock acquired, bot starting...")
 
-def cleanup_lock():
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-            print("🧹 Lock file removed, bot stopped cleanly.")
-    except Exception:
-        pass
-
-atexit.register(cleanup_lock)
-
-# ---------------------------
-# LOGGING & CONFIG
-# ---------------------------
+# ======================
+# CONFIG
+# ======================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN not set")
-    raise SystemExit(1)
-
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
-
-# Admins: comma-separated environment variable
-_ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = set()
-if _ADMIN_IDS_RAW:
-    try:
-        ADMIN_IDS = set(int(i.strip()) for i in _ADMIN_IDS_RAW.split(",") if i.strip())
-    except Exception:
-        ADMIN_IDS = set()
-
+OWNER_ID = int(os.getenv("OWNER_ID", "7186582328"))
 TAGS = ["#pria", "#wanita"]
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003595038397"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003439614621"))
 
-# Default images (for text-only menfess)
-# These can be local file paths (absolute or relative) or HTTP(S) URLs.
-DEFAULT_MALE_IMAGE = os.getenv("DEFAULT_MALE_IMAGE", "")   # e.g. /app/data/default_male.jpg or https://...
-DEFAULT_FEMALE_IMAGE = os.getenv("DEFAULT_FEMALE_IMAGE", "") # e.g. /app/data/default_female.jpg or https://...
+# ======================
+# LIMITS / QUEUE / STATE
+# ======================
+MAX_DAILY = 2  # max downloads per user per day
 
-# ---------------------------
-# LIMITS / COOLDOWNS
-# ---------------------------
-LIMITS = {
-    "download": int(os.getenv("LIMIT_DOWNLOAD", "2")),
-    "menfess_text": int(os.getenv("LIMIT_MENFESS_TEXT", "5")),
-    "menfess_media": int(os.getenv("LIMIT_MENFESS_MEDIA", "10")),
-}
+# New per-user posting limits (per 24h)
+MAX_PHOTO_VIDEO_PER_DAY = 10
+MAX_TEXT_PER_DAY = 5
+DAILY_SECONDS = 24 * 60 * 60
 
-COOLDOWNS = {
-    "download": int(os.getenv("CD_DOWNLOAD", "5")),
-    "menfess_text": int(os.getenv("CD_MENFESS_TEXT", "3")),
-    "menfess_media": int(os.getenv("CD_MENFESS_MEDIA", "5")),
-}
+USER_DAILY_STATS: dict[int, dict] = {}  # user_id -> {"count": int, "first_ts": float} (for downloads)
+USER_ACTIVE_DOWNLOAD: set[int] = set()
+download_lock = asyncio.Semaphore(1)
 
-TELEGRAM_MAX_BYTES = 50 * 1024 * 1024
-DAILY_SECONDS = 24 * 3600
+# New: per-user post stats (photo/video and text) stored in-memory
+USER_POST_STATS: Dict[int, Dict[str, int or float]] = {}  # user_id -> {"first_ts": float, "photos_vids": int, "texts": int}
 
-# ---------------------------
-# DB (SQLite) init
-# ---------------------------
-DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "users.db"))
+# ======================
+# DATABASE (safe path + fallback)
+# ======================
+DB_PATH = os.getenv("DB_PATH", "/app/data/users.db")
 db_dir = os.path.dirname(DB_PATH)
 try:
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 except Exception as e:
-    logger.exception("Failed making DB dir %s: %s", db_dir, e)
+    logger.exception("Gagal membuat direktori database %s: %s", db_dir, e)
     DB_PATH = ":memory:"
+    logger.warning("Menggunakan SQLite in-memory fallback (tidak persistent).")
 
 try:
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    _conn.execute("PRAGMA journal_mode=WAL;")
-except Exception:
-    logger.exception("Failed open DB, switching to memory")
-    _conn = sqlite3.connect(":memory:", check_same_thread=False)
-    _conn.execute("PRAGMA journal_mode=WAL;")
+    db = sqlite3.connect(DB_PATH, check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL;")
+except sqlite3.OperationalError as e:
+    logger.exception("Gagal membuka database %s: %s", DB_PATH, e)
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL;")
+    logger.warning("Fallback ke in-memory SQLite database (data tidak disimpan).")
 
-_conn.row_factory = sqlite3.Row
-_db_lock = asyncio.Lock()
-
-def init_db(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute(
-        """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        gender TEXT
-    )
+# tables
+db.execute(
     """
-    )
-    cur.execute(
-        """
-    CREATE TABLE IF NOT EXISTS welcomed_users (
-        user_id INTEGER,
-        chat_id INTEGER,
-        PRIMARY KEY (user_id, chat_id)
-    )
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    gender TEXT
+)
+"""
+)
+db.execute(
     """
-    )
-    cur.execute(
-        """
-    CREATE TABLE IF NOT EXISTS usage_log (
-        user_id INTEGER,
-        usage_type TEXT,
-        count INTEGER DEFAULT 0,
-        date TEXT,
-        PRIMARY KEY (user_id, usage_type, date)
-    )
-    """
-    )
-    cur.execute(
-        """
-    CREATE TABLE IF NOT EXISTS last_actions (
-        user_id INTEGER,
-        usage_type TEXT,
-        last_ts REAL,
-        PRIMARY KEY (user_id, usage_type)
-    )
-    """
-    )
-    conn.commit()
+CREATE TABLE IF NOT EXISTS welcomed_users (
+    user_id INTEGER,
+    chat_id INTEGER,
+    PRIMARY KEY (user_id, chat_id)
+)
+"""
+)
+db.commit()
 
-init_db(_conn)
+# ======================
+# HELPERS
+# ======================
 
-def get_db_conn() -> sqlite3.Connection:
-    return _conn
 
-# ---------------------------
-# Utilities: URL / image detection
-# ---------------------------
-URL_RE = re.compile(r"https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|telegram\.me/[^\s]+", flags=re.IGNORECASE)
+def is_user_allowed(user_id: int, max_daily: int = MAX_DAILY) -> Tuple[bool, int]:
+    now = time.time()
+    stats = USER_DAILY_STATS.get(user_id)
+    if not stats:
+        return True, 0
+    first_ts = stats["first_ts"]
+    count = stats["count"]
+    elapsed = now - first_ts
+    if elapsed >= DAILY_SECONDS:
+        return True, 0
+    if count < max_daily:
+        return True, 0
+    remaining = int(DAILY_SECONDS - elapsed)
+    return False, remaining
+
+
+def increment_user_count(user_id: int):
+    now = time.time()
+    stats = USER_DAILY_STATS.get(user_id)
+    if not stats:
+        USER_DAILY_STATS[user_id] = {"count": 1, "first_ts": now}
+    else:
+        first_ts = stats["first_ts"]
+        if now - first_ts >= DAILY_SECONDS:
+            USER_DAILY_STATS[user_id] = {"count": 1, "first_ts": now}
+        else:
+            stats["count"] += 1
+
+
+def decrement_user_count_on_failure(user_id: int):
+    stats = USER_DAILY_STATS.get(user_id)
+    if not stats:
+        return
+    if stats["count"] <= 1:
+        USER_DAILY_STATS.pop(user_id, None)
+    else:
+        stats["count"] -= 1
+
+
+def human_time(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    if h:
+        return f"{h} jam {m} menit"
+    if m:
+        return f"{m} menit"
+    return "beberapa detik"
+
+
+URL_RE = re.compile(
+    r"https?://[^\s]+|www\.[^\s]+|t\.me/[^\s]+|telegram\.me/[^\s]+", flags=re.IGNORECASE
+)
+
 
 def extract_first_url(msg: Message) -> Optional[str]:
     if not msg:
@@ -219,152 +230,88 @@ def extract_first_url(msg: Message) -> Optional[str]:
     m = URL_RE.search(hay)
     return m.group(0) if m else None
 
+
 def is_image_url(url: str) -> bool:
-    if not url:
-        return False
     url = url.lower().split("?")[0]
     return any(url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
 
-def human_time(seconds: int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    if h:
-        return f"{h} jam {m} menit"
-    if m:
-        return f"{m} menit"
-    return "beberapa detik"
 
-# ---------------------------
-# Admin helper
-# ---------------------------
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS or user_id == OWNER_ID
+# ======================
+# Post-limits helpers (photo/video & text)
+# ======================
 
-# ---------------------------
-# Usage and cooldown (DB-backed)
-# ---------------------------
-async def check_limit(user_id: int, usage_type: str) -> bool:
-    """Return True if allowed (used < limit) or no limit set. Admins bypass."""
-    if is_admin(user_id):
-        return True
-    limit = LIMITS.get(usage_type)
-    if limit is None:
-        return True
-    today = date.today().isoformat()
-    conn = get_db_conn()
-    async with _db_lock:
-        cur = conn.cursor()
-        cur.execute("SELECT count FROM usage_log WHERE user_id=? AND usage_type=? AND date=?", (user_id, usage_type, today))
-        row = cur.fetchone()
-        used = row["count"] if row else 0
-    return used < limit
 
-async def increment_usage(user_id: int, usage_type: str):
-    """Increment today's usage. Admins do NOT increment."""
-    if is_admin(user_id):
-        return
-    today = date.today().isoformat()
-    conn = get_db_conn()
-    async with _db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            """
-        INSERT INTO usage_log (user_id, usage_type, count, date)
-        VALUES (?, ?, 1, ?)
-        ON CONFLICT(user_id, usage_type, date)
-        DO UPDATE SET count = count + 1
-        """,
-            (user_id, usage_type, today),
-        )
-        conn.commit()
-
-async def get_usage_today(user_id: int, usage_type: Optional[str] = None) -> Tuple[int, Optional[int]]:
-    """Return (used, limit) for a usage_type or total used (limit None)."""
-    conn = get_db_conn()
-    today = date.today().isoformat()
-    async with _db_lock:
-        cur = conn.cursor()
-        if usage_type:
-            cur.execute("SELECT count FROM usage_log WHERE user_id=? AND usage_type=? AND date=?", (user_id, usage_type, today))
-            row = cur.fetchone()
-            used = row["count"] if row else 0
-            limit = LIMITS.get(usage_type)
-            return used, limit
-        else:
-            cur.execute("SELECT SUM(count) as s FROM usage_log WHERE user_id=? AND date=?", (user_id, today))
-            row = cur.fetchone()
-            used = int(row["s"]) if row and row["s"] is not None else 0
-            return used, None
-
-# Persisted cooldowns
-async def get_last_action_db(user_id: int, usage_type: str) -> Optional[float]:
-    conn = get_db_conn()
-    async with _db_lock:
-        cur = conn.cursor()
-        cur.execute("SELECT last_ts FROM last_actions WHERE user_id=? AND usage_type=?", (user_id, usage_type))
-        row = cur.fetchone()
-        return float(row["last_ts"]) if row and row["last_ts"] is not None else None
-
-async def set_last_action_db(user_id: int, usage_type: str, ts: Optional[float] = None):
-    if ts is None:
-        ts = time.time()
-    conn = get_db_conn()
-    async with _db_lock:
-        cur = conn.cursor()
-        cur.execute(
-            """
-        INSERT INTO last_actions (user_id, usage_type, last_ts)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, usage_type) DO UPDATE SET last_ts=excluded.last_ts
-        """,
-            (user_id, usage_type, ts),
-        )
-        conn.commit()
-
-async def is_on_cooldown(user_id: int, usage_type: str) -> Tuple[bool, int]:
-    """Return (on_cooldown, seconds_left). Admins bypass."""
-    if is_admin(user_id):
-        return False, 0
+def _reset_post_stats_if_needed(stats: Dict[str, int or float]) -> Dict[str, int or float]:
     now = time.time()
-    last = await get_last_action_db(user_id, usage_type)
-    cd = COOLDOWNS.get(usage_type, 0)
-    if last is None:
-        return False, 0
-    left = int(cd - (now - last))
-    if left > 0:
-        return True, left
-    return False, 0
+    first_ts = stats.get("first_ts", 0)
+    if now - first_ts >= DAILY_SECONDS:
+        return {"first_ts": now, "photos_vids": 0, "texts": 0}
+    return stats
 
-# ---------------------------
-# Menfess helpers (validate and record user gender)
-# ---------------------------
-async def ensure_user_gender(user_id: int, username: Optional[str], gender: str) -> Tuple[bool, Optional[str]]:
-    """
-    Ensure gender consistency. Returns (ok, existing_gender_or_none).
-    Gender is immutable once set (cannot be changed) — persistence in 'users' table.
-    """
-    conn = get_db_conn()
-    async with _db_lock:
-        cur = conn.cursor()
-        cur.execute("SELECT gender FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        if row:
-            existing = row["gender"]
-            if existing != gender:
-                return False, existing
-            return True, existing
-        else:
-            cur.execute("INSERT INTO users (user_id, username, gender) VALUES (?, ?, ?)", (user_id, username, gender))
-            conn.commit()
-            return True, None
 
-async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str, default_photo: Optional[str] = None):
+def is_post_allowed(user_id: int, kind: str) -> Tuple[bool, int]:
     """
-    Send a log copy to LOG_CHANNEL_ID. If default_photo provided (path or URL), send photo + caption similar to public channel.
+    kind: "media" or "text"
+    Returns (allowed, remaining_count)
     """
+    now = time.time()
+    stats = USER_POST_STATS.get(user_id)
+    if not stats:
+        # allowed full quota
+        remaining = MAX_PHOTO_VIDEO_PER_DAY if kind == "media" else MAX_TEXT_PER_DAY
+        return True, remaining
+    stats = _reset_post_stats_if_needed(stats)
+    USER_POST_STATS[user_id] = stats
+    if kind == "media":
+        used = stats.get("photos_vids", 0)
+        if used >= MAX_PHOTO_VIDEO_PER_DAY:
+            remaining_seconds = int(DAILY_SECONDS - (now - stats["first_ts"]))
+            return False, remaining_seconds
+        return True, MAX_PHOTO_VIDEO_PER_DAY - used
+    else:
+        used = stats.get("texts", 0)
+        if used >= MAX_TEXT_PER_DAY:
+            remaining_seconds = int(DAILY_SECONDS - (now - stats["first_ts"]))
+            return False, remaining_seconds
+        return True, MAX_TEXT_PER_DAY - used
+
+
+def increment_post_count(user_id: int, kind: str):
+    now = time.time()
+    stats = USER_POST_STATS.get(user_id)
+    if not stats:
+        stats = {"first_ts": now, "photos_vids": 0, "texts": 0}
+        USER_POST_STATS[user_id] = stats
+    else:
+        stats = _reset_post_stats_if_needed(stats)
+        USER_POST_STATS[user_id] = stats
+    if kind == "media":
+        stats["photos_vids"] = stats.get("photos_vids", 0) + 1
+    else:
+        stats["texts"] = stats.get("texts", 0) + 1
+
+
+def decrement_post_count_on_failure(user_id: int, kind: str):
+    stats = USER_POST_STATS.get(user_id)
+    if not stats:
+        return
+    key = "photos_vids" if kind == "media" else "texts"
+    if stats.get(key, 0) <= 1:
+        stats[key] = 0
+    else:
+        stats[key] -= 1
+
+
+# ======================
+# CORE HANDLERS
+# ======================
+
+
+async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str):
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
+    # Escape user-supplied content to avoid HTML injection
     user_text = escape_html((msg.caption or msg.text or ""))
     log_caption = (
         f"👤 <b>Nama:</b> {escape_html(name)}\n"
@@ -374,46 +321,23 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
         f"{user_text}"
     )
     try:
-        if default_photo:
-            # default_photo may be URL or local path
-            if default_photo.startswith("http://") or default_photo.startswith("https://"):
-                await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=default_photo, caption=log_caption, parse_mode=ParseMode.HTML)
-            elif os.path.exists(default_photo):
-                with open(default_photo, "rb") as fh:
-                    await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=fh, caption=log_caption, parse_mode=ParseMode.HTML)
-            else:
-                # fallback to text log
-                await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_caption, parse_mode=ParseMode.HTML)
+        if getattr(msg, "photo", None):
+            await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=msg.photo[-1].file_id, caption=log_caption, parse_mode=ParseMode.HTML)
+        elif getattr(msg, "video", None):
+            await context.bot.send_video(chat_id=LOG_CHANNEL_ID, video=msg.video.file_id, caption=log_caption, parse_mode=ParseMode.HTML)
         else:
-            # if original msg has media, use it; otherwise send text log
-            if getattr(msg, "photo", None):
-                await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=msg.photo[-1].file_id, caption=log_caption, parse_mode=ParseMode.HTML)
-            elif getattr(msg, "video", None):
-                await context.bot.send_video(chat_id=LOG_CHANNEL_ID, video=msg.video.file_id, caption=log_caption, parse_mode=ParseMode.HTML)
-            else:
-                await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_caption, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_caption, parse_mode=ParseMode.HTML)
     except Exception:
-        logger.exception("Failed to send log")
+        logger.exception("Gagal mengirim log")
 
-# ---------------------------
-# HANDLERS
-# ---------------------------
-
-USER_ACTIVE_DOWNLOAD: set[int] = set()
-download_lock = asyncio.Semaphore(1)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Private menfess handler: accepts text or media (photo/video) as menfess.
-    Requires #pria or #wanita in message/caption.
-    For text-only menfess, attach a default photo for the corresponding gender if configured.
-    Gender is immutable once set in DB (cannot be changed).
-    """
     msg = update.message
     if not msg or not msg.from_user or msg.from_user.is_bot:
         return
 
     text_lower = (msg.text or msg.caption or "").lower()
+
     gender = None
     for tag in TAGS:
         if tag in text_lower:
@@ -427,79 +351,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     username = msg.from_user.username
 
-    ok, existing = await ensure_user_gender(user_id, username, gender)
-    if not ok:
-        await msg.reply_text(f"❌ Post ditolak.\nGender akun kamu sudah tercatat sebagai #{existing}.")
-        return
-
+    # Determine whether this is media (photo/video) or text-only
     is_media = bool(getattr(msg, "photo", None) or getattr(msg, "video", None))
-    usage_type = "menfess_media" if is_media else "menfess_text"
 
-    # cooldown
-    on_cd, left = await is_on_cooldown(user_id, usage_type)
-    if on_cd:
-        await msg.reply_text(f"⏳ Tunggu {left}s sebelum mengirim { 'foto/video' if is_media else 'teks' } lagi.")
-        return
-
-    # limit
-    allowed = await check_limit(user_id, usage_type)
+    # Check posting limits per user
+    kind = "media" if is_media else "text"
+    allowed, rem = is_post_allowed(user_id, kind)
     if not allowed:
-        limit = LIMITS.get(usage_type)
-        used, _ = await get_usage_today(user_id, usage_type)
+        # rem is remaining seconds until reset
         await msg.reply_text(
-            f"😅 Kuota kirim { 'foto/video' if is_media else 'teks' } hari ini sudah habis.\n"
-            f"📅 Batas: {limit} per hari\n"
-            f"📌 Penggunaan hari ini: {used}/{limit}\n"
-            f"⏳ Coba lagi besok"
+            f"😅 Kuota kirim { 'foto/video' if kind=='media' else 'teks' } hari ini sudah habis.\n"
+            f"⏳ Reset dalam {human_time(rem)}\n"
+            f"📅 Batas: {MAX_PHOTO_VIDEO_PER_DAY if kind=='media' else MAX_TEXT_PER_DAY} per hari"
         )
         return
 
-    caption = msg.caption or msg.text or ""
+    with db:
+        cur = db.cursor()
+        cur.execute("SELECT gender FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if row and row[0] != gender:
+            await msg.reply_text(f"❌ Post ditolak.\nGender akun kamu sudah tercatat sebagai #{row[0]}.")
+            return
+        if not row:
+            cur.execute("INSERT INTO users (user_id, username, gender) VALUES (?,?,?)", (user_id, username, gender))
 
-    # Decide default photo for text-only menfess
-    default_photo = None
-    if not is_media:
-        if gender == "pria" and DEFAULT_MALE_IMAGE:
-            default_photo = DEFAULT_MALE_IMAGE
-        elif gender == "wanita" and DEFAULT_FEMALE_IMAGE:
-            default_photo = DEFAULT_FEMALE_IMAGE
-
-    # attempt to forward to public channel, only increment count if success
+    caption = msg.text or msg.caption or ""
+    # Attempt to send to public channel, only increment count if success
     try:
-        if is_media:
-            if getattr(msg, "photo", None):
-                await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
-            elif getattr(msg, "video", None):
-                await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
+        if getattr(msg, "photo", None):
+            await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
+            # success -> increment media count
+            increment_post_count(user_id, "media")
+        elif getattr(msg, "video", None):
+            await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
+            increment_post_count(user_id, "media")
         else:
-            if default_photo:
-                # default_photo can be a URL or local file path
-                if default_photo.startswith("http://") or default_photo.startswith("https://"):
-                    await context.bot.send_photo(chat_id=CHANNEL_ID, photo=default_photo, caption=caption)
-                elif os.path.exists(default_photo):
-                    with open(default_photo, "rb") as fh:
-                        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=fh, caption=caption)
-                else:
-                    # fallback to text message if file missing
-                    await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
-            else:
-                await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            increment_post_count(user_id, "text")
     except Exception as e:
-        logger.exception("Failed to send menfess to channel: %s", e)
         await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
         return
 
-    # success -> log, set cooldown, increment usage (admins skipped)
-    await send_to_log_channel(context, msg, gender, default_photo=default_photo)
-    await set_last_action_db(user_id, usage_type)
-    await increment_usage(user_id, usage_type)
+    await send_to_log_channel(context, msg, gender)
+    await msg.reply_text("✅ Post berhasil dikirim.")
 
-    # reply
-    if is_admin(user_id):
-        await msg.reply_text("✅ Post berhasil dikirim (admin: unlimited).")
-    else:
-        used, limit = await get_usage_today(user_id, usage_type)
-        await msg.reply_text(f"✅ Post berhasil dikirim ({used}/{limit}).")
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -515,13 +411,12 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if user.is_bot:
             continue
         user_id = user.id
-        async with _db_lock:
-            cur = get_db_conn().cursor()
+        with db:
+            cur = db.cursor()
             cur.execute("SELECT 1 FROM welcomed_users WHERE user_id=? AND chat_id=?", (user_id, chat_id))
             if cur.fetchone():
                 continue
             cur.execute("INSERT INTO welcomed_users (user_id, chat_id) VALUES (?, ?)", (user_id, chat_id))
-            get_db_conn().commit()
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -537,6 +432,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ),
             parse_mode=ParseMode.HTML,
         )
+
 
 async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -566,9 +462,12 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Ban gagal")
 
-# ---------------------------
-# Moderation commands (ban/kick/unban)
-# ---------------------------
+
+# ======================
+# Moderation: ban/kick/unban
+# ======================
+
+
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -599,6 +498,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"✅ User {target_user_id} telah di-unban.")
     except Exception as e:
         await msg.reply_text(f"❌ Gagal unban: {str(e)}")
+
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -643,6 +543,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Gagal ban: %s", e)
         await msg.reply_text(f"❌ Gagal ban: {e}")
 
+
 async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -679,45 +580,44 @@ async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Gagal kick: %s", e)
         await msg.reply_text(f"❌ Gagal kick: {e}")
 
-# ---------------------------
-# DOWNLOAD FLOW
-# ---------------------------
+
+# ======================
+# DOWNLOAD FLOW (yt_dlp + image support)
+# ======================
+
+
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.from_user:
         return
-    user_id = msg.from_user.id
     url = extract_first_url(msg)
     if not url:
         await msg.reply_text("❌ Tidak menemukan URL di pesan.")
         return
 
-    # image direct URL handling
+    # image direct URL
     if is_image_url(url):
-        # cooldown and limit check for download
-        on_cd, left = await is_on_cooldown(user_id, "download")
-        if on_cd:
-            await msg.reply_text(f"⏳ Tunggu {left}s sebelum melakukan download lagi.")
-            return
-        allowed = await check_limit(user_id, "download")
+        user_id = msg.from_user.id
+        allowed, remaining = is_user_allowed(user_id)
         if not allowed:
-            used, limit = await get_usage_today(user_id, "download")
-            await msg.reply_text("😅 Kuota download hari ini sudah habis\n\n" f"📅 Limit: {limit} download / hari\n" f"📌 Penggunaan: {used}/{limit}\n" f"⏳ Coba lagi besok")
+            await msg.reply_text("😅 Kuota download hari ini sudah habis\n\n" f"⏳ Reset dalam {human_time(remaining)}\n" f"📅 Limit: {MAX_DAILY} download / hari")
             return
 
         await msg.reply_text("⏳ Mengunduh foto...")
         tmpf_name = None
         try:
+            import aiohttp
+
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(url, timeout=30) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}")
                     content_length = resp.headers.get("Content-Length")
-                    if content_length and int(content_length) > TELEGRAM_MAX_BYTES:
+                    if content_length and int(content_length) > 50 * 1024 * 1024:
                         await msg.reply_text("❌ Foto lebih besar dari 50MB, tidak dapat dikirim.")
                         return
                     data = await resp.read()
-                    if len(data) > TELEGRAM_MAX_BYTES:
+                    if len(data) > 50 * 1024 * 1024:
                         await msg.reply_text("❌ Foto lebih besar dari 50MB, tidak dapat dikirim.")
                         return
                     tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(url).suffix or ".jpg")
@@ -726,27 +626,21 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tmpf.close()
                     tmpf_name = tmpf.name
 
-            # send to user (private)
+            increment_user_count(user_id)
             try:
+                # ensure file descriptor is closed and use with to auto-close file object used by PTB
                 with open(tmpf_name, "rb") as fh:
                     try:
                         await context.bot.send_photo(chat_id=user_id, photo=fh)
                     except Exception:
                         fh.seek(0)
                         await context.bot.send_document(chat_id=user_id, document=fh)
-                # success -> persist usage + cooldown
-                await increment_usage(user_id, "download")
-                await set_last_action_db(user_id, "download")
-                if is_admin(user_id):
-                    await msg.reply_text("✅ Foto berhasil dikirim (admin: unlimited).")
-                else:
-                    used, limit = await get_usage_today(user_id, "download")
-                    await msg.reply_text(f"✅ Foto berhasil dikirim ({used}/{limit}).")
-            except Exception as e:
-                logger.exception("Failed send photo to user: %s", e)
-                # no increment on failure (we increment only on success)
-                await msg.reply_text(f"❌ Gagal mengirim foto: {e}")
+                await msg.reply_text("✅ Foto berhasil dikirim.")
+            except Exception:
+                decrement_user_count_on_failure(user_id)
+                raise
         except Exception as e:
+            decrement_user_count_on_failure(user_id)
             logger.exception("Gagal mengunduh foto: %s", e)
             await msg.reply_text(f"❌ Gagal mengunduh foto: {e}")
         finally:
@@ -757,7 +651,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # video/audio flow: prompt quality
+    # otherwise video/audio flow
     context.user_data["download_url"] = url
     keyboard = [
         [InlineKeyboardButton("360p", callback_data="q_360"), InlineKeyboardButton("720p", callback_data="q_720")],
@@ -765,6 +659,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await msg.reply_text("Pilih kualitas download:", reply_markup=reply_markup)
+
 
 async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -781,39 +676,26 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in USER_ACTIVE_DOWNLOAD:
         await query.answer("⏳ Download kamu masih berjalan", show_alert=True)
         return
-
-    on_cd, left = await is_on_cooldown(user_id, "download")
-    if on_cd:
-        await query.edit_message_text(f"⏳ Tunggu {left}s sebelum coba lagi.")
-        return
-    allowed = await check_limit(user_id, "download")
+    allowed, remaining = is_user_allowed(user_id)
     if not allowed:
-        used, limit = await get_usage_today(user_id, "download")
-        await query.edit_message_text("😅 Kuota download hari ini sudah habis\n\n" f"📅 Limit: {limit} download / hari\n" f"📌 Penggunaan: {used}/{limit}\n" f"⏳ Coba lagi besok")
+        await query.edit_message_text("😅 Kuota download hari ini sudah habis\n\n" f"⏳ Reset dalam {human_time(remaining)}\n" f"📅 Limit: {MAX_DAILY} download / hari")
         return
-
     await query.edit_message_text("⏳ Mengunduh, mohon tunggu...")
     tmpdir = None
     try:
         async with download_lock:
             USER_ACTIVE_DOWNLOAD.add(user_id)
-            # we will increment usage AFTER successful send to user
+            increment_user_count(user_id)
             tmpdir = tempfile.mkdtemp(prefix="yt-dl-")
             out_template = str(Path(tmpdir) / "output.%(ext)s")
             ffmpeg_available = shutil.which("ffmpeg") is not None
 
             if data == "q_mp3":
                 if not ffmpeg_available:
-                    await query.edit_message_text("⚠️ Konversi ke MP3 memerlukan ffmpeg yang tidak tersedia di server.")
+                    await query.edit_message_text("⚠️ Konversi ke MP3 memerlukan ffmpeg yang tidak tersedia di server. Pilih video atau gunakan Docker.")
+                    decrement_user_count_on_failure(user_id)
                     return
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": out_template,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noplaylist": True,
-                    "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-                }
+                ydl_opts = {"format": "bestaudio/best", "outtmpl": out_template, "quiet": True, "no_warnings": True, "noplaylist": True, "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],}
             else:
                 max_h = 360 if data == "q_360" else 720
                 if ffmpeg_available:
@@ -837,12 +719,15 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             size_bytes = output_file.stat().st_size
             logger.info("Downloaded file: %s (%d bytes)", output_file, size_bytes)
 
+            TELEGRAM_MAX_BYTES = 50 * 1024 * 1024
             if size_bytes > TELEGRAM_MAX_BYTES:
                 await query.edit_message_text("❌ File lebih besar dari 50MB sehingga tidak dapat dikirim melalui Bot Telegram.\nSilakan unduh langsung dari sumber (link) atau gunakan metode lain.")
+                decrement_user_count_on_failure(user_id)
                 return
 
             suffix = output_file.suffix.lower()
             try:
+                # Use file-like objects to ensure file descriptors are closed after sending
                 with open(output_file, "rb") as fh:
                     if suffix in (".mp4", ".mkv", ".webm", ".mov"):
                         await context.bot.send_video(chat_id=user_id, video=fh)
@@ -850,20 +735,17 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_audio(chat_id=user_id, audio=fh)
                     else:
                         await context.bot.send_document(chat_id=user_id, document=fh)
-            except Exception as e:
-                logger.exception("Failed sending downloaded file: %s", e)
-                raise RuntimeError(f"Gagal mengirim file ke pengguna: {e}")
+            except Exception:
+                try:
+                    # fallback: try sending as document by reopening
+                    with open(output_file, "rb") as fh:
+                        await context.bot.send_document(chat_id=user_id, document=fh)
+                except Exception as e:
+                    raise RuntimeError(f"Gagal mengirim file ke pengguna: {e}")
 
-            # success -> persist usage + cooldown
-            await set_last_action_db(user_id, "download")
-            await increment_usage(user_id, "download")
-
-            if is_admin(user_id):
-                await query.edit_message_text("✅ Download selesai. File telah dikirim (admin: unlimited).")
-            else:
-                used, limit = await get_usage_today(user_id, "download")
-                await query.edit_message_text(f"✅ Download selesai. Penggunaan hari ini: {used}/{limit}")
+            await query.edit_message_text("✅ Download selesai. File telah dikirim ke chat pribadi.")
     except Exception as exc:
+        decrement_user_count_on_failure(user_id)
         logger.exception("Error during download: %s", exc)
         try:
             await query.edit_message_text(f"❌ Gagal mengunduh: {exc}")
@@ -877,9 +759,12 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ---------------------------
-# TAG / ADMIN utilities
-# ---------------------------
+
+# ======================
+# TAG COMMANDS
+# ======================
+
+
 async def tag_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -928,6 +813,7 @@ async def tag_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Gagal menandai member: %s", e)
         await msg.reply_text(f"❌ Gagal menandai member: {e}")
 
+
 async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -951,8 +837,8 @@ async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif msg.reply_to_message and msg.reply_to_message.text:
         custom_text = msg.reply_to_message.text
 
-    async with _db_lock:
-        cur = get_db_conn().cursor()
+    with db:
+        cur = db.cursor()
         cur.execute("SELECT user_id FROM welcomed_users WHERE chat_id=?", (chat.id,))
         rows = cur.fetchall()
     user_ids = [r[0] for r in rows if r and isinstance(r[0], int)]
@@ -961,17 +847,17 @@ async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     seen = set()
-    deduped = [uid for uid in user_ids if not (uid in seen or seen.add(uid))]
+    user_ids = [uid for uid in user_ids if not (uid in seen or seen.add(uid))]
     MAX_TOTAL = 1000
-    if len(deduped) > MAX_TOTAL:
-        await msg.reply_text(f"⚠️ Terdapat {len(deduped)} user, terlalu banyak untuk ditag sekaligus.")
+    if len(user_ids) > MAX_TOTAL:
+        await msg.reply_text(f"⚠️ Terdapat {len(user_ids)} user, terlalu banyak untuk ditag sekaligus.")
         return
 
     batch_size = 20
     sent_batches = 0
     try:
-        for i in range(0, len(deduped), batch_size):
-            batch = deduped[i : i + batch_size]
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i : i + batch_size]
             mentions = " ".join(f'<a href="tg://user?id={uid}">.</a>' for uid in batch)
             body = custom_text or "Perhatian dari admin."
             text = f"🔔 Panggilan untuk semua:\n{mentions}\n\n{body}"
@@ -983,79 +869,104 @@ async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Gagal mengirim tagall: {e}")
         return
 
-    await msg.reply_text(f"✅ Selesai mengirim tag kepada {len(deduped)} user dalam {sent_batches} batch.")
+    await msg.reply_text(f"✅ Selesai mengirim tag kepada {len(user_ids)} user dalam {sent_batches} batch.")
 
-# ---------------------------
-# HELP
-# ---------------------------
+
+# ======================
+# HELP COMMAND
+# ======================
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
+    chat = msg.chat
+    user = msg.from_user
+
     all_features = (
         "📚 Fitur Bot (lengkap):\n\n"
+        "Member:\n"
         "- Menfess via private: kirim teks/foto/video dengan tag #pria atau #wanita\n"
-        "- Untuk teks menfess, bot akan menambahkan foto default sesuai gender jika dikonfigurasi\n"
-        "- Download video/audio dari link (YouTube/TikTok/IG/...) pilih 360p/720p/MP3\n"
+        "- Download video/audio dari hampir semua link (YouTube/TikTok/IG/...) pilih 360p/720p/MP3\n"
         "- Download foto dari direct image URL\n"
-        f"- Batas file dikirim oleh bot: {TELEGRAM_MAX_BYTES//(1024*1024)} MB\n"
-        f"- Limit download: {LIMITS.get('download')}x per hari per user\n"
-        f"- Limit menfess per hari: foto/video {LIMITS.get('menfess_media')}x, teks {LIMITS.get('menfess_text')}x\n\n"
-        "Admin commands: /tag /tagall /ban /kick /unban\n"
+        "- Batas file dikirim oleh bot: 50 MB\n"
+        f"- Limit download: {MAX_DAILY}x per hari per user\n"
+        f"- Limit menfess per hari: foto/video {MAX_PHOTO_VIDEO_PER_DAY}x, teks {MAX_TEXT_PER_DAY}x\n\n"
+        "Admin (harus admin/owner di grup):\n"
+        "- /tag <user_id> <pesan> atau reply + /tag : menandai 1 member\n"
+        "- /tagall [pesan] : menandai semua member yang tersimpan (batched)\n"
+        "- /ban <user_id> [hours] : ban user (optional durasi dalam jam)\n"
+        "- /kick <user_id> atau reply + /kick : kick user dari grup\n"
+        "- /unban <user_id> : unban user\n\n"
+        "Lainnya:\n"
+        "- Auto welcome untuk member baru (welcome berisi link bot & channel)\n"
+        "- Anti-link di grup (hapus + ban sementara)\n"
+        "- Gunakan /help untuk melihat bantuan ini\n"
     )
-    await msg.reply_text(all_features)
+    if chat.type in ("group", "supergroup"):
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+        except Exception:
+            member = None
+        if member and member.status in ("administrator", "creator") or user.id == OWNER_ID:
+            await msg.reply_text("Halo Admin!\n\n" + all_features)
+        else:
+            await msg.reply_text("Halo Member!\n\n" + all_features)
+    else:
+        await msg.reply_text(all_features)
 
-# ---------------------------
-# MAIN: register handlers & start
-# ---------------------------
+
+# ======================
+# MAIN
+# ======================
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is not set.")
         return
-    if not CHANNEL_ID or not LOG_CHANNEL_ID:
-        logger.warning("CHANNEL_ID or LOG_CHANNEL_ID not set; menfess or log may fail.")
 
-    if ADMIN_IDS:
-        logger.info("Admin IDs: %s", ADMIN_IDS)
-    if OWNER_ID:
-        logger.info("Owner ID: %s", OWNER_ID)
-    if DEFAULT_MALE_IMAGE:
-        logger.info("Default male image configured: %s", DEFAULT_MALE_IMAGE)
-    if DEFAULT_FEMALE_IMAGE:
-        logger.info("Default female image configured: %s", DEFAULT_FEMALE_IMAGE)
-
-    # attempt to delete webhook to avoid conflicts
+    # Ensure no webhook conflicts: attempt to delete webhook at startup (with timeout)
     try:
-        import requests
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=5)
-    except Exception:
-        pass
+        resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=5)
+        logger.info("deleteWebhook response: %s", resp.text)
+    except Exception as e:
+        logger.exception("Gagal delete webhook: %s", e)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Private menfess handler: exclude messages that contain url/text_link and commands
+    # PRIVATE menfess handler: exclude messages that contain url/text_link
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & ~filters.Entity("url") & ~filters.Entity("text_link") & ~filters.COMMAND, handle_message)
     )
-    # Welcome
+
+    # Welcome new members
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+
     # Anti-link in groups
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")), anti_link))
+
     # Moderation
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("kick", kick_user))
-    # Download handlers (private messages with links)
+
+    # Download handlers
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.Entity("url") | filters.Entity("text_link")), download_video))
     app.add_handler(CallbackQueryHandler(quality_callback, pattern="^q_"))
-    # Tagging
+
+    # Tag commands
     app.add_handler(CommandHandler("tag", tag_member))
     app.add_handler(CommandHandler("tagall", tag_all))
-    # help
+
+    # HELP
     app.add_handler(CommandHandler("help", help_command))
 
     logger.info("Bot running...")
+    # Use drop_pending_updates=True to discard old updates and avoid processing backlog
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
