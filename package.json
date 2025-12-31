@@ -1,0 +1,17 @@
+{
+  "name": "telegram-feedback-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot dengan webhook, posting channel, anti spam, dan admin control",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.19.2"
+  }
+}
