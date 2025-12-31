@@ -69,7 +69,14 @@ from telegram.ext import (
 from telegram.helpers import escape_html
 
 from yt_dlp import YoutubeDL
- YoutubeDL
+
+def download_video(url):
+    ydl_opts = {
+        "outtmpl": "downloads/%(title)s.%(ext)s"
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
 
 # ======================
 # CONFIG
@@ -961,4 +968,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
