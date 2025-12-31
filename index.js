@@ -61,6 +61,13 @@ bot.on(["text", "photo", "video"], async (ctx) => {
   }
 });
 
+bot.on("channel_post", async (ctx) => {
+  try {
+    await ctx.telegram.unpinChatMessage(ctx.chat.id);
+  } catch (e) {}
+});
+
+
 // ===== DOWNLOAD LIMIT =====
 bot.hears(/https?:\/\//, (ctx) => {
   dailyDownload[ctx.from.id] ??= 0;
@@ -119,3 +126,4 @@ bot.command("kick", async (ctx) => {
 
 bot.launch();
 console.log("Bot hidup. Sayangnya.");
+
