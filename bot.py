@@ -4,9 +4,43 @@ Telegram menfess / downloader bot (cleaned: removed 'rude mode').
 
 File utama: bot.py
 """
+
+# ======================
+# SINGLE INSTANCE LOCK
+# ======================
+import os
+import sys
+import atexit
+
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
+
+if os.path.exists(LOCK_FILE):
+    print("❌ Bot already running (lock file detected). Exiting.")
+    sys.exit(0)
+
+with open(LOCK_FILE, "w") as f:
+    f.write(str(os.getpid()))
+
+print("✅ Lock acquired, bot starting...")
+
+def cleanup_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            print("🧹 Lock file removed, bot stopped cleanly.")
+    except Exception:
+        pass
+
+atexit.register(cleanup_lock)
+
+# ======================
+# IMPORTS (NORMAL FLOW)
+# ======================
 import asyncio
 import logging
-import os
 import re
 import requests
 import shutil
@@ -34,8 +68,8 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_html
 
-# yt_dlp Python API
 from yt_dlp import YoutubeDL
+ YoutubeDL
 
 # ======================
 # CONFIG
@@ -927,3 +961,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
