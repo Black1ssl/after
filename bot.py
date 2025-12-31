@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram menfess / downloader bot (clean, merged & fixed)
+Telegram menfess / downloader bot (final, merged & fixed)
 
 Features:
 - Single-instance lockfile
@@ -31,12 +31,7 @@ import aiohttp
 from html import escape as escape_html
 from yt_dlp import YoutubeDL
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -101,7 +96,7 @@ if _ADMIN_IDS_RAW:
 TAGS = ["#pria", "#wanita"]
 
 # Default images (for text-only menfess)
-# Can be env var (URL or local path). If env var empty, auto-detect files in DATA_DIR.
+# Accept env var (URL or local path). If env var empty, auto-detect files in DATA_DIR.
 DEFAULT_MALE_IMAGE = os.getenv("DEFAULT_MALE_IMAGE", "").strip()
 DEFAULT_FEMALE_IMAGE = os.getenv("DEFAULT_FEMALE_IMAGE", "").strip()
 
@@ -362,16 +357,30 @@ async def ensure_user_gender(user_id: int, username: Optional[str], gender: str)
 # ---------------------------
 # Default images (auto-detect)
 # ---------------------------
-# If env vars empty, look for files in DATA_DIR.
 if not DEFAULT_MALE_IMAGE:
-    candidate = os.path.join(DATA_DIR, "default_male.png")
+    candidate = os.path.join(DATA_DIR, "default_male.jpg")
     if os.path.exists(candidate):
         DEFAULT_MALE_IMAGE = candidate
 
 if not DEFAULT_FEMALE_IMAGE:
-    candidate = os.path.join(DATA_DIR, "default_female.png")
+    candidate = os.path.join(DATA_DIR, "default_female.jpg")
     if os.path.exists(candidate):
         DEFAULT_FEMALE_IMAGE = candidate
+
+# ---------------------------
+# Helpers for safe caption and truncation
+# ---------------------------
+def safe_caption(text: Optional[str], limit: int = 1024) -> Optional[str]:
+    if not text:
+        return None
+    txt = str(text).replace("\x00", "")
+    return txt[:limit] if len(txt) > limit else txt
+
+def safe_text_message(text: Optional[str], limit: int = 4096) -> str:
+    if not text:
+        return ""
+    txt = str(text).replace("\x00", "")
+    return txt[:limit] if len(txt) > limit else txt
 
 # ---------------------------
 # Logging function (send to LOG_CHANNEL)
@@ -390,7 +399,7 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
     )
     try:
         if default_photo:
-            if default_photo.startswith("http://") or default_photo.startswith("https://"):
+            if default_photo.startswith(("http://", "https://")):
                 await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=default_photo, caption=log_caption, parse_mode=ParseMode.HTML)
             elif os.path.exists(default_photo):
                 with open(default_photo, "rb") as fh:
@@ -410,7 +419,7 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
 # ---------------------------
 # HANDLERS (menfess, welcome, anti-link, moderation, download)
 # ---------------------------
-USER_ACTIVE_DOWNLOAD: set[int] = set()
+USER_ACTIVE_DOWNLOAD = set()
 download_lock = asyncio.Semaphore(1)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,7 +471,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    caption = msg.caption or msg.text or ""
+    # prepare caption safely
+    caption_raw = msg.caption if getattr(msg, "caption", None) else (msg.text or "")
+    caption_for_media = safe_caption(caption_raw, limit=1024)
+    caption_for_text = safe_text_message(caption_raw, limit=4096)
 
     # default photo for text-only menfess
     default_photo = None
@@ -472,31 +484,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif gender == "wanita" and DEFAULT_FEMALE_IMAGE:
             default_photo = DEFAULT_FEMALE_IMAGE
 
-    # forward to public channel
+    # forward to public channel (use safe captions and generic user errors)
     try:
         if is_media:
             if getattr(msg, "photo", None):
-                await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
+                await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption_for_media)
             elif getattr(msg, "video", None):
-                await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
+                await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption_for_media)
+            else:
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=caption_for_text)
         else:
             if default_photo:
-                if default_photo.startswith("http://") or default_photo.startswith("https://"):
-                    await context.bot.send_photo(chat_id=CHANNEL_ID, photo=default_photo, caption=caption)
+                if default_photo.startswith(("http://", "https://")):
+                    await context.bot.send_photo(chat_id=CHANNEL_ID, photo=default_photo, caption=caption_for_media)
                 elif os.path.exists(default_photo):
                     with open(default_photo, "rb") as fh:
-                        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=fh, caption=caption)
+                        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=fh, caption=caption_for_media)
                 else:
-                    await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+                    await context.bot.send_message(chat_id=CHANNEL_ID, text=caption_for_text)
             else:
-                await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
-    except Exception as e:
-        logger.exception("Failed to send menfess to channel: %s", e)
-        await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=caption_for_text)
+    except Exception:
+        logger.exception("Failed to send menfess to channel")
+        await msg.reply_text("❌ Gagal mengirim menfess. Silakan coba lagi.")
         return
 
     # success -> log, set cooldown, increment usage (admins skipped)
-    await send_to_log_channel(context, msg, gender, default_photo=default_photo)
+    try:
+        await send_to_log_channel(context, msg, gender, default_photo=default_photo)
+    except Exception:
+        logger.exception("Failed to send log after menfess")
     await set_last_action_db(user_id, usage_type)
     await increment_usage(user_id, usage_type)
 
@@ -507,6 +524,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         used, limit = await get_usage_today(user_id, usage_type)
         await msg.reply_text(f"✅ Post berhasil dikirim ({used}/{limit}).")
 
+# ---------------------------
+# WELCOME NEW MEMBER
+# ---------------------------
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -544,6 +564,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode=ParseMode.HTML,
         )
 
+# ---------------------------
+# ANTI-LINK (GROUPS)
+# ---------------------------
 async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.from_user:
@@ -572,7 +595,9 @@ async def anti_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Ban gagal")
 
-# Moderation commands
+# ---------------------------
+# MODERATION COMMANDS
+# ---------------------------
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -683,7 +708,9 @@ async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Gagal kick: %s", e)
         await msg.reply_text(f"❌ Gagal kick: {e}")
 
-# Tagging
+# ---------------------------
+# TAGGING
+# ---------------------------
 async def tag_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -790,228 +817,6 @@ async def tag_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"✅ Selesai mengirim tag kepada {len(deduped)} user dalam {sent_batches} batch.")
 
 # ---------------------------
-# DOWNLOAD FLOW
-# ---------------------------
-async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.from_user:
-        return
-    user_id = msg.from_user.id
-    url = extract_first_url(msg)
-    if not url:
-        await msg.reply_text("❌ Tidak menemukan URL di pesan.")
-        return
-
-    # image direct URL handling
-    if is_image_url(url):
-        on_cd, left = await is_on_cooldown(user_id, "download")
-        if on_cd:
-            await msg.reply_text(f"⏳ Tunggu {left}s sebelum melakukan download lagi.")
-            return
-        allowed = await check_limit(user_id, "download")
-        if not allowed:
-            used, limit = await get_usage_today(user_id, "download")
-            await msg.reply_text(
-                "😅 Kuota download hari ini sudah habis\n\n"
-                f"📅 Limit: {limit} download / hari\n"
-                f"📌 Penggunaan: {used}/{limit}\n"
-                "⏳ Coba lagi besok"
-            )
-            return
-
-        await msg.reply_text("⏳ Mengunduh foto...")
-        tmpf_name = None
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(url, timeout=30) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    content_length = resp.headers.get("Content-Length")
-                    if content_length and int(content_length) > TELEGRAM_MAX_BYTES:
-                        await msg.reply_text("❌ Foto lebih besar dari 50MB, tidak dapat dikirim.")
-                        return
-                    data = await resp.read()
-                    if len(data) > TELEGRAM_MAX_BYTES:
-                        await msg.reply_text("❌ Foto lebih besar dari 50MB, tidak dapat dikirim.")
-                        return
-                    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(url).suffix or ".jpg")
-                    tmpf.write(data)
-                    tmpf.flush()
-                    tmpf.close()
-                    tmpf_name = tmpf.name
-
-            try:
-                with open(tmpf_name, "rb") as fh:
-                    try:
-                        await context.bot.send_photo(chat_id=user_id, photo=fh)
-                    except Exception:
-                        fh.seek(0)
-                        await context.bot.send_document(chat_id=user_id, document=fh)
-                await increment_usage(user_id, "download")
-                await set_last_action_db(user_id, "download")
-                if is_admin(user_id):
-                    await msg.reply_text("✅ Foto berhasil dikirim (admin: unlimited).")
-                else:
-                    used, limit = await get_usage_today(user_id, "download")
-                    await msg.reply_text(f"✅ Foto berhasil dikirim ({used}/{limit}).")
-            except Exception as e:
-                logger.exception("Failed send photo to user: %s", e)
-                await msg.reply_text(f"❌ Gagal mengirim foto: {e}")
-        except Exception as e:
-            logger.exception("Gagal mengunduh foto: %s", e)
-            await msg.reply_text(f"❌ Gagal mengunduh foto: {e}")
-        finally:
-            try:
-                if tmpf_name and os.path.exists(tmpf_name):
-                    os.unlink(tmpf_name)
-            except Exception:
-                pass
-        return
-
-    # video/audio flow
-    context.user_data["download_url"] = url
-    keyboard = [
-        [InlineKeyboardButton("360p", callback_data="q_360"), InlineKeyboardButton("720p", callback_data="q_720")],
-        [InlineKeyboardButton("🎵 MP3", callback_data="q_mp3")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await msg.reply_text("Pilih kualitas download:", reply_markup=reply_markup)
-
-async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    user = query.from_user
-    user_id = user.id
-    data = query.data
-    url = context.user_data.get("download_url")
-    if not url:
-        await query.edit_message_text("❌ URL tidak ditemukan. Kirim ulang link.")
-        return
-    if user_id in USER_ACTIVE_DOWNLOAD:
-        await query.answer("⏳ Download kamu masih berjalan", show_alert=True)
-        return
-
-    on_cd, left = await is_on_cooldown(user_id, "download")
-    if on_cd:
-        await query.edit_message_text(f"⏳ Tunggu {left}s sebelum coba lagi.")
-        return
-    allowed = await check_limit(user_id, "download")
-    if not allowed:
-        used, limit = await get_usage_today(user_id, "download")
-        await query.edit_message_text(
-            "😅 Kuota download hari ini sudah habis\n\n"
-            f"📅 Limit: {limit} download / hari\n"
-            f"📌 Penggunaan: {used}/{limit}\n"
-            "⏳ Coba lagi besok"
-        )
-        return
-
-    await query.edit_message_text("⏳ Mengunduh, mohon tunggu...")
-    tmpdir = None
-    try:
-        async with download_lock:
-            USER_ACTIVE_DOWNLOAD.add(user_id)
-            tmpdir = tempfile.mkdtemp(prefix="yt-dl-")
-            out_template = str(Path(tmpdir) / "output.%(ext)s")
-            ffmpeg_available = shutil.which("ffmpeg") is not None
-
-            if data == "q_mp3":
-                if not ffmpeg_available:
-                    await query.edit_message_text("⚠️ Konversi ke MP3 memerlukan ffmpeg yang tidak tersedia di server.")
-                    return
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": out_template,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noplaylist": True,
-                    "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-                }
-            else:
-                max_h = 360 if data == "q_360" else 720
-                if ffmpeg_available:
-                    fmt = f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]"
-                    ydl_opts = {"format": fmt, "outtmpl": out_template, "merge_output_format": "mp4", "quiet": True, "no_warnings": True, "noplaylist": True}
-                else:
-                    ydl_opts = {"format": "best", "outtmpl": out_template, "quiet": True, "no_warnings": True, "noplaylist": True}
-
-            def run_ydl():
-                with YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-
-            await asyncio.to_thread(run_ydl)
-
-            files = list(Path(tmpdir).iterdir())
-            if not files:
-                raise RuntimeError("Download gagal — tidak ada file output dari yt-dlp.")
-            files_sorted = sorted(files, key=lambda p: p.stat().st_size, reverse=True)
-            output_file = files_sorted[0]
-            size_bytes = output_file.stat().st_size
-            logger.info("Downloaded file: %s (%d bytes)", output_file, size_bytes)
-
-            if size_bytes > TELEGRAM_MAX_BYTES:
-                await query.edit_message_text("❌ File lebih besar dari 50MB sehingga tidak dapat dikirim melalui Bot Telegram.\nSilakan unduh langsung dari sumber (link) atau gunakan metode lain.")
-                return
-
-            suffix = output_file.suffix.lower()
-            try:
-                with open(output_file, "rb") as fh:
-                    if suffix in (".mp4", ".mkv", ".webm", ".mov"):
-                        await context.bot.send_video(chat_id=user_id, video=fh)
-                    elif suffix in (".mp3", ".m4a", ".aac", ".opus"):
-                        await context.bot.send_audio(chat_id=user_id, audio=fh)
-                    else:
-                        await context.bot.send_document(chat_id=user_id, document=fh)
-            except Exception as e:
-                logger.exception("Failed sending downloaded file: %s", e)
-                raise RuntimeError(f"Gagal mengirim file ke pengguna: {e}")
-
-            # success -> persist usage + cooldown
-            await set_last_action_db(user_id, "download")
-            await increment_usage(user_id, "download")
-
-            if is_admin(user_id):
-                await query.edit_message_text("✅ Download selesai. File telah dikirim (admin: unlimited).")
-            else:
-                used, limit = await get_usage_today(user_id, "download")
-                await query.edit_message_text(f"✅ Download selesai. Penggunaan hari ini: {used}/{limit}")
-    except Exception as exc:
-        logger.exception("Error during download: %s", exc)
-        try:
-            await query.edit_message_text(f"❌ Gagal mengunduh: {exc}")
-        except Exception:
-            pass
-    finally:
-        USER_ACTIVE_DOWNLOAD.discard(user_id)
-        try:
-            if tmpdir and Path(tmpdir).exists():
-                shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
-
-# ---------------------------
-# HELP
-# ---------------------------
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg:
-        return
-    all_features = (
-        "📚 Fitur Bot (lengkap):\n\n"
-        "- Menfess via private: kirim teks/foto/video dengan tag #pria atau #wanita\n"
-        "- Untuk teks menfess, bot akan menambahkan foto default sesuai gender jika dikonfigurasi\n"
-        "- Download video/audio dari link (YouTube/TikTok/IG/...) pilih 360p/720p/MP3\n"
-        "- Download foto dari direct image URL\n"
-        f"- Batas file dikirim oleh bot: {TELEGRAM_MAX_BYTES//(1024*1024)} MB\n"
-        f"- Limit download: {LIMITS.get('download')}x per hari per user\n"
-        f"- Limit menfess per hari: foto/video {LIMITS.get('menfess_media')}x, teks {LIMITS.get('menfess_text')}x\n\n"
-        "Admin commands: /tag /tagall /ban /kick /unban\n"
-    )
-    await msg.reply_text(all_features)
-
-# ---------------------------
 # MAIN: register handlers & start
 # ---------------------------
 def main():
@@ -1039,25 +844,18 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Private menfess handler: exclude messages that contain url/text_link and commands
-    app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & ~filters.Entity("url") & ~filters.Entity("text_link") & ~filters.COMMAND, handle_message)
-    )
-    # Welcome new members
+    # Register handlers
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.Entity("url") & ~filters.Entity("text_link") & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
-    # Anti-link in groups
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.Entity("url") | filters.Entity("text_link")), anti_link))
-    # Moderation
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("kick", kick_user))
-    # Download handlers (private messages with links)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.Entity("url") | filters.Entity("text_link")), download_video))
-    app.add_handler(CallbackQueryHandler(quality_callback, pattern="^q_"))
-    # Tagging
     app.add_handler(CommandHandler("tag", tag_member))
     app.add_handler(CommandHandler("tagall", tag_all))
-    # help
+    # Note: download & quality handlers are intentionally registered below if you want them active:
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.Entity("url") | filters.Entity("text_link")), lambda u, c: download_video(u, c)))
+    app.add_handler(CallbackQueryHandler(lambda u, c: quality_callback(u, c), pattern="^q_"))
     app.add_handler(CommandHandler("help", help_command))
 
     logger.info("Bot running...")
@@ -1065,4 +863,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
