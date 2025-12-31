@@ -9,6 +9,7 @@ Features:
 - Persisted cooldowns stored in last_actions (survive restart)
 - Admins (ADMIN_IDS) bypass limits and cooldowns; admin actions do NOT increment usage
 - Menfess flow: requires #pria or #wanita in message (text or media). Forwards to CHANNEL_ID and logs to LOG_CHANNEL_ID
+  - For text-only menfess, the bot will attach a default photo based on gender (male/female) when configured.
 - Download flow: supports direct image URL download and yt-dlp for video/audio (choice via inline keyboard)
 - Safe DB access via asyncio.Lock
 - Uses python-telegram-bot v20+ async API
@@ -99,6 +100,11 @@ if _ADMIN_IDS_RAW:
         ADMIN_IDS = set()
 
 TAGS = ["#pria", "#wanita"]
+
+# Default images (for text-only menfess)
+# These can be local file paths (absolute or relative) or HTTP(S) URLs.
+DEFAULT_MALE_IMAGE = os.getenv("DEFAULT_MALE_IMAGE", "")   # e.g. /app/data/default_male.jpg or https://...
+DEFAULT_FEMALE_IMAGE = os.getenv("DEFAULT_FEMALE_IMAGE", "") # e.g. /app/data/default_female.jpg or https://...
 
 # ---------------------------
 # LIMITS / COOLDOWNS
@@ -335,6 +341,7 @@ async def is_on_cooldown(user_id: int, usage_type: str) -> Tuple[bool, int]:
 async def ensure_user_gender(user_id: int, username: Optional[str], gender: str) -> Tuple[bool, Optional[str]]:
     """
     Ensure gender consistency. Returns (ok, existing_gender_or_none).
+    Gender is immutable once set (cannot be changed) — persistence in 'users' table.
     """
     conn = get_db_conn()
     async with _db_lock:
@@ -351,7 +358,10 @@ async def ensure_user_gender(user_id: int, username: Optional[str], gender: str)
             conn.commit()
             return True, None
 
-async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str):
+async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, gender: str, default_photo: Optional[str] = None):
+    """
+    Send a log copy to LOG_CHANNEL_ID. If default_photo provided (path or URL), send photo + caption similar to public channel.
+    """
     user = msg.from_user
     username = f"@{user.username}" if user.username else "(no username)"
     name = user.first_name or "-"
@@ -364,12 +374,24 @@ async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, msg: Message, 
         f"{user_text}"
     )
     try:
-        if getattr(msg, "photo", None):
-            await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=msg.photo[-1].file_id, caption=log_caption, parse_mode=ParseMode.HTML)
-        elif getattr(msg, "video", None):
-            await context.bot.send_video(chat_id=LOG_CHANNEL_ID, video=msg.video.file_id, caption=log_caption, parse_mode=ParseMode.HTML)
+        if default_photo:
+            # default_photo may be URL or local path
+            if default_photo.startswith("http://") or default_photo.startswith("https://"):
+                await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=default_photo, caption=log_caption, parse_mode=ParseMode.HTML)
+            elif os.path.exists(default_photo):
+                with open(default_photo, "rb") as fh:
+                    await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=fh, caption=log_caption, parse_mode=ParseMode.HTML)
+            else:
+                # fallback to text log
+                await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_caption, parse_mode=ParseMode.HTML)
         else:
-            await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_caption, parse_mode=ParseMode.HTML)
+            # if original msg has media, use it; otherwise send text log
+            if getattr(msg, "photo", None):
+                await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=msg.photo[-1].file_id, caption=log_caption, parse_mode=ParseMode.HTML)
+            elif getattr(msg, "video", None):
+                await context.bot.send_video(chat_id=LOG_CHANNEL_ID, video=msg.video.file_id, caption=log_caption, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_caption, parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Failed to send log")
 
@@ -384,6 +406,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Private menfess handler: accepts text or media (photo/video) as menfess.
     Requires #pria or #wanita in message/caption.
+    For text-only menfess, attach a default photo for the corresponding gender if configured.
+    Gender is immutable once set in DB (cannot be changed).
     """
     msg = update.message
     if not msg or not msg.from_user or msg.from_user.is_bot:
@@ -421,9 +445,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = await check_limit(user_id, usage_type)
     if not allowed:
         limit = LIMITS.get(usage_type)
-        remaining_seconds = 0
-        # compute remaining seconds using last_actions if needed
-        # simpler: fetch today's used and respond with reset message
         used, _ = await get_usage_today(user_id, usage_type)
         await msg.reply_text(
             f"😅 Kuota kirim { 'foto/video' if is_media else 'teks' } hari ini sudah habis.\n"
@@ -433,22 +454,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # attempt to forward to public channel (increment only on success)
     caption = msg.caption or msg.text or ""
+
+    # Decide default photo for text-only menfess
+    default_photo = None
+    if not is_media:
+        if gender == "pria" and DEFAULT_MALE_IMAGE:
+            default_photo = DEFAULT_MALE_IMAGE
+        elif gender == "wanita" and DEFAULT_FEMALE_IMAGE:
+            default_photo = DEFAULT_FEMALE_IMAGE
+
+    # attempt to forward to public channel, only increment count if success
     try:
-        if getattr(msg, "photo", None):
-            await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
-        elif getattr(msg, "video", None):
-            await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
+        if is_media:
+            if getattr(msg, "photo", None):
+                await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
+            elif getattr(msg, "video", None):
+                await context.bot.send_video(chat_id=CHANNEL_ID, video=msg.video.file_id, caption=caption)
         else:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            if default_photo:
+                # default_photo can be a URL or local file path
+                if default_photo.startswith("http://") or default_photo.startswith("https://"):
+                    await context.bot.send_photo(chat_id=CHANNEL_ID, photo=default_photo, caption=caption)
+                elif os.path.exists(default_photo):
+                    with open(default_photo, "rb") as fh:
+                        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=fh, caption=caption)
+                else:
+                    # fallback to text message if file missing
+                    await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            else:
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=caption)
     except Exception as e:
         logger.exception("Failed to send menfess to channel: %s", e)
         await msg.reply_text(f"❌ Gagal mengirim ke channel publik: {e}")
         return
 
     # success -> log, set cooldown, increment usage (admins skipped)
-    await send_to_log_channel(context, msg, gender)
+    await send_to_log_channel(context, msg, gender, default_photo=default_photo)
     await set_last_action_db(user_id, usage_type)
     await increment_usage(user_id, usage_type)
 
@@ -953,6 +995,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_features = (
         "📚 Fitur Bot (lengkap):\n\n"
         "- Menfess via private: kirim teks/foto/video dengan tag #pria atau #wanita\n"
+        "- Untuk teks menfess, bot akan menambahkan foto default sesuai gender jika dikonfigurasi\n"
         "- Download video/audio dari link (YouTube/TikTok/IG/...) pilih 360p/720p/MP3\n"
         "- Download foto dari direct image URL\n"
         f"- Batas file dikirim oleh bot: {TELEGRAM_MAX_BYTES//(1024*1024)} MB\n"
@@ -976,6 +1019,10 @@ def main():
         logger.info("Admin IDs: %s", ADMIN_IDS)
     if OWNER_ID:
         logger.info("Owner ID: %s", OWNER_ID)
+    if DEFAULT_MALE_IMAGE:
+        logger.info("Default male image configured: %s", DEFAULT_MALE_IMAGE)
+    if DEFAULT_FEMALE_IMAGE:
+        logger.info("Default female image configured: %s", DEFAULT_FEMALE_IMAGE)
 
     # attempt to delete webhook to avoid conflicts
     try:
